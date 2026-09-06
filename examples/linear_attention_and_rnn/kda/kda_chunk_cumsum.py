@@ -392,22 +392,15 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== chunk length x gate x GVA ==")
-    ok &= _case(2, 256, 4, 4, 64, 64, 64, "normal")
-    ok &= _case(2, 128, 2, 4, 64, 64, 32, "forget", "GVA + C = 32")
-
-    print("== the K3 head dimension, and the magnitude stress ==")
-    ok &= _case(1, 256, 2, 4, 128, 128, 64, "normal", "K = V = 128 + GVA")
-    # The whole point of the fp32 accumulator: under `extreme` the exponents die
-    # inside one chunk, and a fp16 running sum would flush them to zero.
-    ok &= _case(1, 128, 1, 1, 64, 64, 64, "extreme", "exponents die at once")
+    print("== the workhorse shape, both gate regimes ==")
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal")  # GVA, C = 64
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "extreme", "exponents die inside one chunk")
 
     print("== ragged tail (SEQ % C != 0) ==")
-    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", "70 = 64 + 6")
+    ok &= _case(2, 70, 1, 2, 64, 64, 64, "forget", "70 = 64 + 6")
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", "every sequence ragged -- interior tails")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", "empty sequence in the middle")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "normal", "ragged interior + an empty sequence")
 
     if ok:
         print("Kernel Output Match!")

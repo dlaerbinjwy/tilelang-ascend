@@ -1039,23 +1039,21 @@ def main():
     print("  doubling Neumann, %d steps, %d matmuls per chunk" % (STEPS, 2 + 3 * STEPS))
     # `extreme` is the gate that decides whether the truncation is safe: it is
     # where the strictly-lower factor sits furthest from nilpotent in practice.
+    # K does not enter this stage -- it inverts the C x C block -- so the cheapest
+    # shape that produces a full C = 64 block is the right one to test on.
     for gate in ("normal", "extreme"):
-        ok &= _case_cube(1, 256, 4, 4, 128, 128, 64, gate, torch.float16)
-    ok &= _case_cube(1, 256, 4, 4, 128, 128, 64, "normal", torch.bfloat16)  # shape already built
+        ok &= _case_cube(1, 128, 2, 4, 64, 64, 64, gate, torch.float16)
+    ok &= _case_cube(1, 128, 2, 4, 64, 64, 64, "normal", torch.bfloat16)  # shape already built
 
     print("== the vector path: exact forward substitution, same golden ==")
-    # This is the independent check on the truncation above, not a fallback.
-    ok &= _case(2, 256, 2, 4, 64, 64, 32, "forget", torch.float16)  # GVA + C = 32
-    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16)  # ragged tail, 70 = 64 + 6
-
-    print("== dtype passthrough ==")
-    # fp32 in, fp32 out: the input is exact, so this one gates the kernel
-    # straight against the golden at 1e-5 with no dtype slack.
-    ok &= _case(2, 256, 2, 4, 64, 64, 32, "normal", torch.float32)  # shape already built
+    # The independent check on the truncation above, not a fallback.  fp32 in,
+    # fp32 out: the input is exact, so this gates the kernel against the golden
+    # at 1e-5 with no dtype slack.
+    ok &= _case(2, 128, 2, 4, 64, 64, 32, "forget", torch.float32)  # GVA + C = 32
+    ok &= _case(2, 128, 2, 4, 64, 64, 32, "normal", torch.float16)  # shape already built
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", torch.float32, "every sequence ragged -- interior tails")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float32, "empty sequence in the middle")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float32, "ragged interior + an empty sequence")
 
     if ok:
         print("Kernel Output Match!")

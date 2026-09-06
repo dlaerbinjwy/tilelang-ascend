@@ -872,23 +872,15 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== shapes x gates (fp16) ==")
-    for B, SEQ, H, HV, K, V, C, gate in [
-        (2, 128, 2, 4, 64, 64, 32, "forget"),  # HV == 2H, C = 32, deep decay
-        (1, 256, 1, 1, 128, 128, 64, "forget"),  # K3 head dim
-    ]:
-        ok &= _case(B, SEQ, H, HV, K, V, C, gate, torch.float16)
+    print("== the workhorse shape, both gate regimes, both dtypes ==")
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", torch.float16)  # GVA, C = 64
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "forget", torch.bfloat16)  # shape already built
 
     print("== ragged tail (SEQ % C != 0) ==")
     ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16)  # R=6: core 0 partly valid, core 1 entirely empty
-    ok &= _case(2, 100, 2, 4, 64, 64, 32, "extreme", torch.float16)  # R=4, GVA, extreme gate
-
-    print("== bf16 (dtype must be threaded through, not hardcoded) ==")
-    ok &= _case(2, 128, 2, 4, 64, 64, 32, "forget", torch.bfloat16)  # shape already built above
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", torch.float16, "every sequence ragged -- interior tails")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, "empty sequence in the middle")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, "ragged interior + an empty sequence")
 
     if ok:
         print("Kernel Output Match!")

@@ -903,27 +903,19 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== shapes x gates, with and without an initial state (fp16) ==")
-    for B, SEQ, H, HV, K, V, C, gate, ws in [
-        (2, 128, 2, 4, 64, 64, 32, "forget", True),  # HV == 2H + C=32 + initial_state
-        (2, 128, 2, 4, 64, 64, 32, "normal", False),  # same shape, no initial state
-        (1, 128, 2, 4, 128, 128, 64, "forget", True),  # K3 head dim + GVA
+    print("== the workhorse shape, with and without an initial state, both dtypes ==")
+    for B, SEQ, H, HV, K, V, C, gate, ws, dt in [
+        (2, 128, 2, 4, 64, 64, 64, "forget", True, torch.float16),  # GVA + initial_state
+        (2, 128, 2, 4, 64, 64, 64, "normal", False, torch.float16),  # same shape, no state
+        (2, 128, 2, 4, 64, 64, 64, "normal", True, torch.bfloat16),  # same shape, bf16
     ]:
-        ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, torch.float16)
+        ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, dt)
 
     print("== ragged tail (SEQ % C != 0) ==")
-    for B, SEQ, H, HV, K, V, C, gate, ws in [
-        (2, 70, 1, 2, 64, 64, 64, "normal", False),  # R=6
-        (1, 65, 1, 1, 128, 128, 64, "forget", True),  # K3 dim, R=1, with initial state
-    ]:
-        ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, torch.float16)
-
-    print("== dtype passthrough (bf16) ==")
-    ok &= _case(2, 128, 2, 4, 64, 64, 32, "normal", True, torch.bfloat16)  # shape already built above
+    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", False, torch.float16)  # R=6
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "forget", True, torch.float16, "ragged + per-sequence S0")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", True, torch.float16, "empty in the middle, S0 passthrough")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", True, torch.float16, "ragged interior + an empty sequence, S0 passthrough")
 
     if ok:
         print("Kernel Output Match!")

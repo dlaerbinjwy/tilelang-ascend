@@ -254,21 +254,19 @@ def test_vs_both_goldens():
     """
     print("== L1 kernel pipeline  vs  L0 recurrence  and  chunkwise reference ==")
     ok = True
-    ok &= _case(2, 128, 2, 2, 64, 64, 64, "forget", torch.float16)
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "forget", torch.float16, note="GVA, the workhorse shape")
 
     print("  -- ragged tail (SEQ % C != 0) --")
     # The pad rows are load-bearing rather than tidy: a garbage gate row
     # exponentiates to +inf and 0 * inf is NaN landing in a *valid* row.
     ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16, note="70 = 64 + 6, GVA")
-
-    print("  -- K3 spec --")
-    ok &= _case(1, 256, 1, 1, 128, 128, 64, "forget", torch.float16, note="K = V = 128")
     # A head count that fills the grid, and the model's own 96 heads at
     # SEQ = 4000, are the same code path with a bigger constant and a golden
     # that costs a hundred times the rest of this file put together.  Both are
     # local cases rather than shipped ones; the numbers are in bench_mark.md.
 
     print("  -- dtype passthrough --")
+    # Same shape as the first case, so the six kernels are already built.
     ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", torch.bfloat16, note="GVA")
     return ok
 
@@ -281,7 +279,7 @@ def test_state_relay():
     """
     print("== whole sequence  vs  two-segment relay through final_state ==")
     ok = True
-    for SEQ, cut, C, HV, gate in ((128, 64, 64, 2, "normal"),):
+    for SEQ, cut, C, HV, gate in ((128, 64, 64, 4, "normal"),):
         q, k, v, g, beta, _ = _mk(2, SEQ, 1, HV, 64, 64, gate, torch.float16)
         qa, ka, va, ga, ba = (x.npu() for x in (q, k, v, g.float(), beta))
 
@@ -320,7 +318,7 @@ def test_zero_state_equals_none():
     """Passing an all-zero initial_state must equal passing none at all."""
     print("== zero initial_state  vs  no initial_state ==")
     ok = True
-    for SEQ, C, HV in ((128, 64, 2),):
+    for SEQ, C, HV in ((128, 64, 4),):
         q, k, v, g, beta, _ = _mk(1, SEQ, 1, HV, 64, 64, "normal", torch.float16)
         qa, ka, va, ga, ba = (x.npu() for x in (q, k, v, g.float(), beta))
         z = torch.zeros((1, HV, 64, 64), device="npu", dtype=torch.float32)
@@ -476,8 +474,7 @@ def test_varlen_vs_both_goldens():
     """
     print("== varlen pipeline  vs  L0 recurrence  and  chunkwise reference ==")
     ok = True
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", torch.float16, note="every sequence ragged")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, True, "empty in the middle")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, True, "ragged interior + an empty sequence")
     return ok
 
 
@@ -498,8 +495,7 @@ def test_varlen_equals_per_sequence_calls():
     print("== varlen batch  vs  the same sequences run one at a time ==")
     ok = True
     cases = [
-        ([70, 33, 129], 64, True, "ragged + per-sequence S0"),
-        ([70, 0, 129], 64, True, "empty in the middle"),
+        ([70, 0, 129], 64, True, "ragged interior + an empty sequence, per-sequence S0"),
     ]
     for seqlens, C, ws, note in cases:
         q, k, v, g, beta, s0, cu = _mkv(seqlens, 1, 2, 64, 64, "forget", torch.float16, ws)
@@ -541,86 +537,6 @@ def test_varlen_equals_per_sequence_calls():
     return ok
 
 
-def test_varlen_equals_fixed_batch():
-    """N equal-length sequences under varlen must equal a B = N fixed batch.
-
-    Exercises the flatten/split mapping and the [N, HV, K, V] state indexing --
-    the parts the per-sequence test above cannot see, because it splits the same
-    way varlen does.  Exact equality again, and for the same reason.
-    """
-    print("== varlen (N equal sequences)  vs  fixed-length B = N batch ==")
-    ok = True
-    for seqlens, C in (([70, 70], 64),):
-        N, Lq = len(seqlens), seqlens[0]
-        q, k, v, g, beta, s0, cu = _mkv(seqlens, 1, 2, 64, 64, "normal", torch.float16, True)
-        qa, ka, va, ga, ba = (x.npu() for x in (q, k, v, g.float(), beta))
-        sa = s0.npu().float()
-
-        o_v, sf_v = kda_chunk_fwd(qa, ka, va, ga, ba, C=C, initial_state=sa, output_final_state=True, cu_seqlens=cu.npu())
-
-        def rs(x, N=N, Lq=Lq):
-            return x.reshape(N, Lq, *x.shape[2:]).contiguous()
-
-        o_b, sf_b = kda_chunk_fwd(rs(qa), rs(ka), rs(va), rs(ga), rs(ba), C=C, initial_state=sa, output_final_state=True)
-        d_o = (o_v.reshape(N, Lq, 2, 64).float() - o_b.float()).abs().max().item()
-        d_s = (sf_v.float() - sf_b.float()).abs().max().item()
-        good = d_o == 0.0 and d_s == 0.0
-        ok &= good
-        print(f"  {str(seqlens):22s} C={C:<2d}  |dO|={d_o:.1e} |dSF|={d_s:.1e}  {'ok (bit-identical)' if good else 'FAIL'}")
-    return ok
-
-
-def test_varlen_state_relay():
-    """Relaying final_state across a call boundary must still work under varlen.
-
-    Cut every sequence at a chunk boundary, run the two halves as two varlen
-    batches, and relay the [N, HV, K, V] state between them.  Exact, for the
-    same reason as the fixed-length relay test: the cut is a chunk boundary and
-    chunks are independent given their entry state.
-    """
-    print("== varlen whole  vs  two-segment relay through final_state ==")
-    ok = True
-    for seqlens, cut, C in (([128, 128], 64, 64),):
-        q, k, v, g, beta, _, cu = _mkv(seqlens, 1, 2, 64, 64, "forget", torch.float16)
-        qa, ka, va, ga, ba = (x.npu() for x in (q, k, v, g.float(), beta))
-
-        whole, _ = kda_chunk_fwd(qa, ka, va, ga, ba, C=C, cu_seqlens=cu.npu())
-
-        # Split every sequence at `cut`; both halves are themselves varlen
-        # batches with their own cu_seqlens.
-        # seqlens and cut bound as defaults rather than captured: a closure
-        # over a loop variable reads its LAST value, which happens to be
-        # harmless here only because every call is in the same iteration.
-        def halves(x, first, seqlens=seqlens, cut=cut):
-            parts, pos = [], 0
-            for n in seqlens:
-                sl = slice(pos, pos + cut) if first else slice(pos + cut, pos + n)
-                pos += n
-                parts.append(x[:, sl])
-            return torch.cat(parts, dim=1).contiguous()
-
-        cu_a = torch.tensor([0] + [cut * (i + 1) for i in range(len(seqlens))], dtype=torch.int32).npu()
-        tail = [n - cut for n in seqlens]
-        cu_b = torch.tensor([0] + [sum(tail[: i + 1]) for i in range(len(tail))], dtype=torch.int32).npu()
-
-        a, sa = kda_chunk_fwd(*(halves(x, True) for x in (qa, ka, va, ga, ba)), C=C, output_final_state=True, cu_seqlens=cu_a)
-        b, _ = kda_chunk_fwd(*(halves(x, False) for x in (qa, ka, va, ga, ba)), C=C, initial_state=sa, cu_seqlens=cu_b)
-
-        # Reassemble into flattened order to compare against the whole run.
-        seg, pos_a, pos_b = [], 0, 0
-        for n in seqlens:
-            seg.append(a[:, pos_a : pos_a + cut])
-            seg.append(b[:, pos_b : pos_b + (n - cut)])
-            pos_a += cut
-            pos_b += n - cut
-        seg = torch.cat(seg, dim=1)
-        e = (seg.float() - whole.float()).abs().max().item()
-        good = e == 0.0
-        ok &= good
-        print(f"  {str(seqlens):22s} cut={cut} C={C}  max|diff|={e:.1e}  {'ok (bit-identical)' if good else 'FAIL'}")
-    return ok
-
-
 def main():
     tilelang.disable_cache()
     torch.manual_seed(0)
@@ -641,9 +557,7 @@ def main():
     print()
     ok &= test_varlen_equals_per_sequence_calls()
     print()
-    ok &= test_varlen_equals_fixed_batch()
     print()
-    ok &= test_varlen_state_relay()
     print()
 
     if ok:

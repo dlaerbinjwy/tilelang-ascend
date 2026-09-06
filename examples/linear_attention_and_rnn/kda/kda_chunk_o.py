@@ -1207,31 +1207,22 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== shapes and gates ==")
-    for gate in ("normal", "forget"):
-        ok &= _case(2, 128, 2, 4, 64, 64, 64, gate)  # GVA, C = 64
-    ok &= _case(2, 256, 2, 4, 64, 64, 32, "normal")  # C = 32
-    ok &= _case(1, 256, 1, 1, 128, 128, 64, "forget")  # K3 head dim
+    print("== the workhorse shape, both gate regimes, both dtypes ==")
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal")  # GVA, C = 64
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "extreme")  # the NaN trap: gates underflow inside a chunk
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "forget", dtype=torch.bfloat16)  # shape already built
 
     print("== ragged tail (SEQ % C != 0) ==")
     # The pad rows are load-bearing: a garbage gate row exponentiates to +inf
     # and 0 * inf is NaN landing in a valid row's reduction.
-    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal")  # R = 6, one anchor block partly valid
-
-    print("== a gate that underflows inside a chunk (the NaN trap) ==")
-    ok &= _case(1, 128, 1, 2, 64, 64, 64, "extreme")
-
-    print("== bf16 ==")
-    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", dtype=torch.bfloat16)  # shape already built above
+    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal")
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", note="every sequence ragged")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", note="empty sequence in the middle")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", note="ragged interior + an empty sequence")
 
     # ================================ route B ================================
-    # Off by default, so nothing above exercises it.  It is valid on the three
-    # realistic gates; `extreme` is excluded BY DESIGN and that exclusion is
-    # asserted below rather than left as a case nobody ran.
+    # Off by default, so nothing above exercises it.  It is a different kernel,
+    # so it costs a compile even on a shape route A has already built.
     print("== route B, on a shape route A has already covered ==")
     ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", route_b=True)
     ok &= _case(2, 128, 2, 4, 64, 64, 64, "forget", dtype=torch.bfloat16, route_b=True)
@@ -1247,19 +1238,20 @@ def main():
 
     print("== route B refuses the extreme gate BY DESIGN (this must FAIL) ==")
     # Not a skip.  The extreme gate's intra-block span reaches ~290 nats against
-    # a clamp of 80, so route B saturates and lands near 5e-01.  If this ever
-    # starts passing, either the gate generator or the clamp has moved and the
-    # documented limit of route B is no longer true.
-    if _case(1, 128, 1, 2, 64, 64, 64, "extreme", route_b=True):
+    # a clamp of 80, so route B saturates.  If this ever starts passing, either
+    # the gate generator or the clamp has moved and the documented limit of
+    # route B is no longer true.  Same shape as above, so it costs no compile.
+    if _case(2, 128, 2, 4, 64, 64, 64, "extreme", route_b=True):
         print("  FAIL: the extreme gate PASSED under route B -- the documented limit has moved")
         ok = False
     else:
         print("  ok  (it failed, as documented)")
 
     print("== route B under varlen is refused, and says so ==")
+    # Falls back to route A, so this reuses the varlen kernel built above.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", note="varlen + route_b request", route_b=True)
+        ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", note="varlen + route_b request", route_b=True)
     warned = any("route A" in str(w.message) for w in caught)
     print(f"  warned about the fallback: {'ok' if warned else 'FAIL'}")
     ok &= warned

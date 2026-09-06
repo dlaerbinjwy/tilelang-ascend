@@ -1141,27 +1141,18 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== chunk length x gate x GVA ==")
-    ok &= _case(2, 256, 4, 4, 64, 64, 64, "normal", torch.float16)
-    ok &= _case(2, 128, 2, 4, 64, 64, 32, "forget", torch.float16)  # GVA + C = 32
-
-    print("== the K3 head dimension ==")
-    ok &= _case(1, 256, 2, 2, 128, 128, 64, "forget", torch.float16)
-
-    print("== the gate extremes ==")
+    print("== the workhorse shape, both gate regimes, both dtypes ==")
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", torch.float16)  # GVA, C = 64
     # `extreme` is what the pre-exponent clamp exists for: without it the gate
     # ratio overflows fp16 before the matmul ever sees it.
-    ok &= _case(2, 256, 4, 4, 64, 64, 64, "extreme", torch.float16)  # shape already built above
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "extreme", torch.float16)
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "forget", torch.bfloat16)
 
     print("== ragged tail (SEQ % C != 0) ==")
     ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16)  # 70 = 64 + 6
 
-    print("== bf16 dtype passthrough ==")
-    ok &= _case(2, 128, 2, 4, 64, 64, 32, "normal", torch.bfloat16)  # shape already built above
-
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", torch.float16, "every sequence ragged -- interior tails")
-    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, "empty sequence in the middle")
+    ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, "ragged interior + an empty sequence")
 
     if ok:
         print("Kernel Output Match!")

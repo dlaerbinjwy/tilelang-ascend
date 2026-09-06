@@ -45,6 +45,28 @@ sys.path.insert(0, _HERE)
 
 from kda_varlen import varlen_bounds
 
+# oneDNN is switched off for these two modules because they ARE the goldens: a
+# reference that quietly computes at reduced precision cannot judge a kernel.
+# On an x86 runner oneDNN may take fp32 matmul through bfloat16 ("fastmath"),
+# selected by ONEDNN_DEFAULT_FPMATH_MODE in the environment rather than by
+# anything in this repository.  It costs three decimal digits and it hits
+# exactly what a chunkwise reference is made of -- measured here, batched only:
+#
+#     2-D  a @ b        5.4e-07 -> 5.4e-07   (OpenBLAS, untouched)
+#     3-D  bmm          4.5e-07 -> 2.1e-03
+#     5-D  matmul       4.8e-07 -> 2.8e-03
+#     einsum            4.9e-07 -> 1.2e-03
+#
+# which lands as 4.4e-03 to 7.3e-03 relative against a 1e-5 acceptance
+# threshold.  Note `torch.set_float32_matmul_precision("highest")` does NOT
+# defeat it -- that is already the default and governs a different path.
+#
+# The failure this prevents is a nasty one to read: every comparison against the
+# token-by-token reference fails while every self-consistency check still
+# passes, because both sides of those degrade together.
+torch.backends.mkldnn.enabled = False
+
+
 __all__ = ["kda_ref", "make_inputs", "make_varlen_inputs", "varlen_bounds"]
 
 
