@@ -739,8 +739,17 @@ def test_varlen_equals_fixed_batch():
     itself a per-sequence loop, so comparing it against a per-sequence loop proves
     nothing; comparing it against the *batched* path exercises the flatten/split
     mapping and the [N, HV, K, V] state indexing, which is where a real mistake
-    would live.  Exact equality, not a tolerance: the two runs perform the same
-    arithmetic in the same order on the same numbers.
+    would live, and a mistake there reads another sequence's data -- an O(1)
+    difference in the output, not a small one.
+
+    The bound is relative and loose on purpose.  These two runs do NOT perform
+    the same arithmetic in the same order: one folds the batch as N calls at
+    B = 1, the other as one call at B = N, and the folded extent is what BLAS
+    blocks its 5-D matmuls over.  Reduction order therefore differs by machine,
+    thread count and shape.  Measured here at 40 threads: exactly 0 for the three
+    shapes below, 7.3e-11 relative on [128, 128] at C = 64, and 1.8e-9 on
+    [512, 512] -- it grows with the accumulation depth.  1e-6 sits four orders
+    above that noise and six below a real indexing bug.
     """
     print("== varlen (N equal sequences)  vs  fixed-length B = N batch ==")
     ok = True
@@ -753,16 +762,15 @@ def test_varlen_equals_fixed_batch():
             return x.reshape(N, L, *x.shape[2:])
 
         o_b, sf_b = kda_chunk_ref(rs(q), rs(k), rs(v), rs(g), rs(beta), C=C, initial_state=s0, output_final_state=True)
-        # Not torch.equal: the two sides fold the batch differently (N calls at
-        # B = 1 against one call at B = N), so BLAS may reduce in a different
-        # order and differ in the last bit -- measured 5.8e-11 on one element in
-        # 65536 at 40 threads on a neighbouring shape.  A real indexing bug moves
-        # an output by O(1), so 1e-9 catches everything exact equality would.
         d_o = (o_v.reshape(N, L, 4, 64) - o_b).abs().max().item()
         d_sf = (sf_v - sf_b).abs().max().item()
-        good = d_o < 1e-9 and d_sf < 1e-9
+        scale = max(o_b.abs().max().item(), sf_b.abs().max().item(), 1e-30)
+        rel = max(d_o, d_sf) / scale
+        good = rel < 1e-6
         ok &= good
-        print(f"  {str(seqlens):18s} C={C:2d}  {'ok (bit-identical)' if good else 'FAIL'}")
+        # The value is printed, not just the verdict: this file's failures reach
+        # CI as a single line, and a verdict without its number cannot be acted on.
+        print(f"  {str(seqlens):18s} C={C:2d}  rel={rel:.2e}  {'ok' if good else 'FAIL'}")
     return ok
 
 
