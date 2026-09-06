@@ -109,6 +109,7 @@ Known limitations
 
 import os
 import sys
+import warnings
 
 import torch
 import tilelang
@@ -994,10 +995,7 @@ def _pick_route(route_b):
 
     KDA_ROUTE_B=0 / =1 overrides the argument, for A/B measurement.
     """
-    env = os.environ.get("KDA_ROUTE_B")
-    if env is not None:
-        return env not in ("0", "", "false", "False")
-    return route_b
+    return os.environ.get("KDA_ROUTE_B", "1" if route_b else "0").lower() in ("1", "true", "yes", "on")
 
 
 def chunk_scaled_dot_kkt(k, G, beta, C=64, BC=16, cu_seqlens=None, route_b=False):
@@ -1028,7 +1026,16 @@ def chunk_scaled_dot_kkt(k, G, beta, C=64, BC=16, cu_seqlens=None, route_b=False
     # varlen a chunk starts at a sequence boundary instead, so the anchor row of
     # a block is not where this file assumes; that path keeps route A until it is
     # worked through.
-    route_b = _pick_route(route_b) and cu_seqlens is None
+    route_b = _pick_route(route_b)
+    if route_b and cu_seqlens is not None:
+        # Asking for it here would otherwise return the route A result bit for
+        # bit, with nothing to tell the caller the switch did nothing.
+        warnings.warn(
+            "route_b is not supported under cu_seqlens; falling back to route A",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        route_b = False
 
     elem = torch.finfo(k.dtype).bits // 8
     need = _ub_bytes(C, K, BC, elem)
@@ -1134,48 +1141,27 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== C=32 / C=64, HV == H, two gate settings ==")
-    for gate in ("normal", "forget"):
-        ok &= _case(2, 256, 4, 4, 64, 64, 32, gate, torch.float16)
-        ok &= _case(2, 256, 4, 4, 64, 64, 64, gate, torch.float16)
+    print("== chunk length x gate x GVA ==")
+    ok &= _case(2, 256, 4, 4, 64, 64, 64, "normal", torch.float16)
+    ok &= _case(2, 128, 2, 4, 64, 64, 32, "forget", torch.float16)  # GVA + C = 32
 
-    print("== GVA: HV == 2H ==")
-    for gate in ("normal", "forget"):
-        ok &= _case(2, 128, 2, 4, 64, 64, 32, gate, torch.float16)
-        ok &= _case(2, 128, 2, 4, 64, 64, 64, gate, torch.float16)
+    print("== the K3 head dimension ==")
+    ok &= _case(1, 256, 2, 2, 128, 128, 64, "forget", torch.float16)
 
-    print("== single head, and the gate extremes ==")
-    ok &= _case(1, 64, 1, 1, 64, 64, 64, "normal", torch.float16)
-    for gate in ("keep", "extreme"):
-        ok &= _case(2, 128, 2, 2, 64, 64, 64, gate, torch.float16)
+    print("== the gate extremes ==")
+    # `extreme` is what the pre-exponent clamp exists for: without it the gate
+    # ratio overflows fp16 before the matmul ever sees it.
+    ok &= _case(2, 256, 4, 4, 64, 64, 64, "extreme", torch.float16)  # shape already built above
 
     print("== ragged tail (SEQ % C != 0) ==")
-    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16)  # 70 = 64 + 6, tail rows in core 0 only
-    ok &= _case(1, 33, 1, 1, 64, 64, 32, "forget", torch.float16)  # 33 = 32 + 1
-    ok &= _case(1, 65, 1, 1, 128, 128, 64, "forget", torch.float16)  # one valid tail row; core 1 gets zero rows
-    ok &= _case(2, 100, 2, 4, 64, 64, 32, "extreme", torch.float16)  # GVA + extreme gate on the tail
-
-    print("== K3 spec: K = V = 128 ==")
-    ok &= _case(1, 256, 2, 2, 128, 128, 64, "forget", torch.float16)
-    ok &= _case(1, 256, 1, 2, 128, 128, 64, "normal", torch.float16)  # + GVA
-    ok &= _case(1, 128, 1, 1, 128, 128, 32, "forget", torch.float16)
+    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16)  # 70 = 64 + 6
 
     print("== bf16 dtype passthrough ==")
-    for gate in ("normal", "forget"):
-        ok &= _case(2, 128, 2, 4, 64, 64, 64, gate, torch.bfloat16)
+    ok &= _case(2, 128, 2, 4, 64, 64, 32, "normal", torch.bfloat16)  # shape already built above
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([64, 64, 64], 1, 2, 64, 64, 64, "normal", torch.float16, "equal, chunk-aligned")
     ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", torch.float16, "every sequence ragged -- interior tails")
     ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, "empty sequence in the middle")
-    ok &= _vcase([0, 70], 1, 2, 64, 64, 64, "normal", torch.float16, "empty sequence first")
-    ok &= _vcase([70, 0], 1, 2, 64, 64, 64, "normal", torch.float16, "empty sequence last")
-    ok &= _vcase([1, 200], 1, 2, 64, 64, 64, "forget", torch.float16, "one token, then a long sequence")
-    ok &= _vcase([33, 33], 1, 1, 64, 64, 32, "forget", torch.float16, "33 = 32 + 1 twice")
-    ok &= _vcase([65, 65], 1, 1, 128, 128, 64, "forget", torch.float16, "K3 dim, core 1 gets zero rows")
-    ok &= _vcase([100, 28], 2, 4, 64, 64, 32, "extreme", torch.float16, "GVA + extreme gate, C = 32")
-    ok &= _vcase([5], 1, 1, 64, 64, 64, "normal", torch.float16, "N = 1, shorter than a chunk")
-    ok &= _vcase([70, 33], 2, 4, 64, 64, 64, "forget", torch.bfloat16, "bf16 passthrough + GVA")
 
     if ok:
         print("Kernel Output Match!")

@@ -103,7 +103,7 @@ matmul.  See §3.2.
 |---|---|---|:---:|---|:---:|---:|---:|
 | 1 | `kda_chunk_cumsum.py` | `B*HV*chunk_num` | yes | K channels | V | 0 | 0 |
 | 2 | `kda_chunk_scaled_dot_kkt.py` | `B*HV*chunk_num` | yes | output rows | V+C | 2 | 1 |
-| 3 | `kda_solve_tril_cube.py` | `ceil(B*HV*N / VEC_NUM)` | yes | **whole tasks** | V+C | 2 | 8 |
+| 3 | `kda_solve_tril.py` | `ceil(B*HV*N / VEC_NUM)` | yes | **whole tasks** | V+C | 2 | 8 |
 | 4 | `kda_wy_fast.py` | `B*HV*chunk_num` | yes | token rows | V+C | 1 | 2 |
 | 5 | `kda_chunk_h.py` | `B*HV*BV_NUM` | **no** | state rows **and** token rows | C+V | 4 | 2 |
 | 6 | `kda_chunk_o.py` | `B*HV*N` | yes | output rows (contiguous) **and** anchor blocks (interleaved) | V+C | 3 | 3 |

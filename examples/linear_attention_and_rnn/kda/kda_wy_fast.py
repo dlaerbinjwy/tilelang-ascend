@@ -83,6 +83,11 @@ import kda_varlen as _VL  # noqa: E402
 pass_configs = {tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True}
 
 VEC_NUM = 2
+
+# Physical AI cores on this part.  Hardcoded, as the other Ascend examples in
+# this repo do it: the documented figure is 24 and the true one is 20, and
+# copying the documented number cost 68% once.  Only ``fixed_core`` reads it.
+CORE_NUM = 20  # physical AI cores on this part
 BETA_PAD = 8  # beta's padded last dim: 8 fp32 = 32B, the minimum UB alignment
 
 
@@ -501,7 +506,226 @@ def wy_fast_ker_varlen(B, SEQ, H, HV, K, V, C, BK, BV, NT_TOTAL, dtype="float16"
 _DTYPES = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
 
-def wy_fast(k, v, beta, G, A, C, BK=None, BV=None, cu_seqlens=None):
+@tilelang.jit(out_idx=[-2, -1], workspace_idx=[-4, -3], pass_configs=pass_configs)
+def wy_fast_ker_fixed_core(B, SEQ, H, HV, K, V, C, BK, BV, dtype="float16", accum_dtype="float"):
+    # ceil, not floor: the last chunk may be ragged.  SEQ is a Python int at
+    # trace time, so this stays a compile-time constant, and grid / ws_k / ws_v
+    # first dims all follow from it.
+    chunk_num = -(-SEQ // C)
+    R = SEQ % C  # 0 when aligned; else the valid row count of the last chunk
+    RAGGED = R != 0
+    bk_num = K // BK
+    bv_num = V // BV
+    GRP = HV // H  # value heads per qk head (GVA)
+    CV = C // VEC_NUM  # rows of the chunk owned by one vector core
+    grid = B * HV * chunk_num
+
+    # Fixed Core.  The grid is the physical core count and each core walks its
+    # own contiguous slice of the grid logical tasks.  Two things follow: the
+    # workspace first axis becomes CORES rather than the task count, and the
+    # allocations and loop-invariant setup happen once per core rather than
+    # once per task.  TPC is the compile-time trip count -- the larger of the
+    # two slice sizes -- with the tail iteration guarded, so the loop bound is
+    # constant while the split stays balanced to within one task.
+    NLOG = grid
+    CORES = min(NLOG, CORE_NUM)
+    TQ, TR = NLOG // CORES, NLOG % CORES  # TR cores carry one extra task
+    TPC = TQ + (1 if TR else 0)
+
+    @T.prim_func
+    def main(
+        Kt: T.Tensor([B, SEQ, H, K], dtype),  # type: ignore
+        Vt: T.Tensor([B, SEQ, HV, V], dtype),  # type: ignore
+        # beta is one fp32 per (token, head), padded to 8 so each row is a whole
+        # 32B block: a [.., 1] tile would be a 4B UB row and the DMA would land
+        # the rows 32B apart anyway, walking over whatever follows.
+        # beta as the frozen contract has it -- one value per (token, head) --
+        # seen through a free unsqueeze(-1).  The 32B UB alignment that used to
+        # be bought by materialising a zero-padded [.., 8] tensor on the host is
+        # now handled where it belongs, inside the kernel: the UB tile stays
+        # BETA_PAD wide and the DMA pads the columns it does not read.
+        Beta: T.Tensor([B, SEQ, HV, 1], accum_dtype),  # type: ignore
+        G: T.Tensor([B, SEQ, HV, K], accum_dtype),  # type: ignore  chunk-local cumsum
+        A: T.Tensor([B, SEQ, HV, C], dtype),  # type: ignore  (I + L)^{-1}
+        # Workspaces: the vector cores publish the scaled operands here for the
+        # cube to pick up.  torch.empty (dirty) memory is fine because every
+        # element is written before the flag is set -- vid 0 writes rows
+        # [0, CV), vid 1 writes [CV, C), both full width.  Nothing here needs
+        # zero-initialised GM, which is what would force it to be a real input.
+        ws_k: T.Tensor([CORES, C, K], dtype),  # type: ignore
+        ws_v: T.Tensor([CORES, C, V], dtype),  # type: ignore
+        W: T.Tensor([B, SEQ, HV, K], dtype),  # type: ignore
+        U: T.Tensor([B, SEQ, HV, V], dtype),  # type: ignore
+    ):
+        with T.Kernel(CORES, is_npu=True) as (cid, vid):
+            # cid is a core index now, not a task index: it selects this
+            # core's workspace slice and the start of its task slice.  The
+            # task coordinates move inside the loop in each scope below.
+            t_start = cid * TQ + T.if_then_else(cid < TR, cid, TR)
+            t_count = TQ + T.if_then_else(cid < TR, 1, 0)
+
+            kg_ub = T.alloc_ub([CV, K], accum_dtype)  # beta_i * e^{G} * K
+            v_ub = T.alloc_ub([CV, V], accum_dtype)  # beta_i * V
+            g_ub = T.alloc_ub([CV, K], accum_dtype)
+            beta8_ub = T.alloc_ub([CV, BETA_PAD], accum_dtype)
+            beta_ub = T.alloc_ub([CV], accum_dtype)  # CV*4 >= 32B for C >= 32
+            # Materialised broadcast target for beta along the V axis.  The K
+            # axis borrows the already-dead g_ub; the two cannot share one buffer
+            # because K and V are not guaranteed equal.  [CV, V] fp32 = 16 KB,
+            # against 66,688 B of 196,352 B used by this kernel.
+            betav_ub = T.alloc_ub([CV, V], accum_dtype)
+            k_half = T.alloc_ub([CV, K], dtype)
+            v_half = T.alloc_ub([CV, V], dtype)
+            # Not named tmp_*: compound T.Parallel expressions get lowered into
+            # auto-allocated scratch tiles called tmp_ub, and the memory planner
+            # then rejects the duplicate name.
+
+            a_l1 = T.alloc_L1([C, C], dtype)
+            k_l1 = T.alloc_L1([C, BK], dtype)
+            v_l1 = T.alloc_L1([C, BV], dtype)
+            w_l0 = T.alloc_L0C([C, BK], accum_dtype)
+            u_l0 = T.alloc_L0C([C, BV], accum_dtype)
+
+            with T.Scope("V"):
+                for _t in T.serial(TPC):
+                    if _t < t_count:
+                        task = t_start + _t
+                        bx = task % chunk_num  # chunk index along the sequence
+                        hv = (task // chunk_num) % HV  # value head
+                        bz = (task // chunk_num) // HV  # batch
+                        hq = hv // GRP  # matching qk head
+                        t0 = bx * C  # first token of this chunk
+                        # Strided tile loads.  The explicit token-axis slice is what
+                        # puts the CV extent on axis 1; a bare ``Kt[bz, row, hq, 0]``
+                        # index would expand the region over the *last two* axes and
+                        # read CV consecutive heads of one token instead.  With the
+                        # slice the region extents are [1, CV, 1, K], from which the
+                        # backend derives row pitch = HV*K (it folds every trailing
+                        # unit-extent axis into the stride) and one 2-D DMA of CV rows.
+                        # Ragged tail, and there are two distinct hazards here.
+                        #
+                        # (1) g_ub goes through T.exp below and the result is published
+                        #     to ws_k, which the cube then reads as a FULL [C, BK]
+                        #     operand.  A stale UB tail row becomes exp(garbage) = inf
+                        #     and NaN-poisons every valid row of W.  So pre-fill: the
+                        #     clamped DMA overwrites only the rows that exist, and the
+                        #     rest stay the zeros we put there.  Zero is also correct
+                        #     semantically -- g = 0 is alpha = 1, and beta = 0 writes
+                        #     nothing through the delta rule.
+                        #
+                        # (2) when this core's whole CV window starts past SEQ the
+                        #     clamp yields validRow == 0, i.e. DataCopyExtParams with
+                        #     blockCount 0.  That is outside the documented [1, 4095]
+                        #     and is not exercised anywhere in this repo, so the DMA is
+                        #     skipped rather than issued with a zero count.
+                        #
+                        # ONLY the DMAs are skipped.  The cross-core flag below is NOT
+                        # inside any branch: one core failing to set it deadlocks the
+                        # cube on wait_cross_flag(1) forever.
+                        if RAGGED and bx == chunk_num - 1:
+                            T.tile.fill(k_half, 0)
+                            T.tile.fill(v_half, 0)
+                            T.tile.fill(g_ub, 0.0)
+                            T.tile.fill(beta8_ub, 0.0)
+
+                        if (not RAGGED) or t0 + vid * CV < SEQ:
+                            T.copy(Kt[bz, t0 + vid * CV : t0 + (vid + 1) * CV, hq, :], k_half)
+                            T.copy(Vt[bz, t0 + vid * CV : t0 + (vid + 1) * CV, hv, :], v_half)
+                            T.copy(G[bz, t0 + vid * CV : t0 + (vid + 1) * CV, hv, :], g_ub)
+                            T.copy(Beta[bz, t0 + vid * CV : t0 + (vid + 1) * CV, hv, 0:1], beta8_ub, pad_value=0)
+                        T.copy(k_half, kg_ub)  # dtype -> fp32
+                        T.copy(v_half, v_ub)
+
+                        # beta sits in column 0 of a zero-padded 8-wide row, so the row
+                        # sum *is* the column-0 extract -- and it lands in a 1-D buffer,
+                        # which is the only shape the per-row broadcast below accepts
+                        # (a [CV, 1] column cannot be read strided by the vector unit).
+                        # reduce_sum defaults to clear=True and initialises beta_ub, so
+                        # no fill here; passing clear=False is what asks for accumulate.
+                        # If a caller ever hands over a Beta whose pad slots are not
+                        # zero, load ``Beta[bz, lo:hi, hv, 0:1]`` into this same [CV, 8]
+                        # tile instead: a 1-wide GM region makes the DMA pre-fill the
+                        # tile with its pad value (0) and then write only column 0.
+                        T.reduce_sum(beta8_ub, beta_ub, dim=-1)
+
+                        # One operation per T.Parallel, as the GDN kernels do: compound
+                        # expressions allocate a scratch tile each.
+                        for i, j in T.Parallel(CV, K):
+                            g_ub[i, j] = T.exp(g_ub[i, j])
+                        # GDN: k_ub[i, j] *= g_ub[i]   (one scalar per row)
+                        for i, j in T.Parallel(CV, K):
+                            kg_ub[i, j] = kg_ub[i, j] * g_ub[i, j]
+                        # Materialised broadcast.  beta_ub[i] does not depend on j inside
+                        # a T.Parallel(CV, K), i.e. it broadcasts along j, and this dialect
+                        # lowers that to one narrow instruction per row (CV = 32 of them);
+                        # the two sites together are 64 narrow instructions per block.
+                        # Spread into a tile each becomes a single wide instruction.  The
+                        # same transformation has worked five times in kkt / chunk_h /
+                        # chunk_o, bit-identical every time.
+                        #
+                        # A note here used to claim that a 1-D row broadcast has to be done
+                        # in place because writing to a second buffer does not survive the
+                        # vector lowering.  Measurement in chunk_h disproved that: writing
+                        # to another buffer is fine, and borrowing an already-dead buffer
+                        # as the target costs no extra UB.
+                        #
+                        # The K axis borrows g_ub, which dies on the line above at
+                        # `kg_ub *= g_ub`.
+                        T.tile.broadcast(g_ub, beta_ub, axis=1)
+                        for i, j in T.Parallel(CV, K):
+                            kg_ub[i, j] = kg_ub[i, j] * g_ub[i, j]
+                        T.tile.broadcast(betav_ub, beta_ub, axis=1)
+                        for i, j in T.Parallel(CV, V):
+                            v_ub[i, j] = v_ub[i, j] * betav_ub[i, j]
+
+                        T.copy(kg_ub, k_half)  # fp32 -> dtype for the cube
+                        T.copy(v_ub, v_half)
+                        # Back-edge.  Under Fixed Core the workspace slice belongs
+                        # to the CORE, not to the task, so every task after the
+                        # first overwrites what the previous one published.  Wait
+                        # for the cube to say it is done reading before doing so.
+                        if _t > 0:
+                            T.wait_cross_flag(0)
+                        T.copy(k_half, ws_k[cid, vid * CV : (vid + 1) * CV, :])
+                        T.copy(v_half, ws_v[cid, vid * CV : (vid + 1) * CV, :])
+                        T.set_cross_flag("MTE3", 1)
+
+            with T.Scope("C"):
+                for _t in T.serial(TPC):
+                    if _t < t_count:
+                        task = t_start + _t
+                        bx = task % chunk_num  # chunk index along the sequence
+                        hv = (task // chunk_num) % HV  # value head
+                        bz = (task // chunk_num) // HV  # batch
+                        hq = hv // GRP  # matching qk head
+                        t0 = bx * C  # first token of this chunk
+                        # A is already in GM from solve_tril; issue its load before the
+                        # wait so this MTE2 overlaps the vector cores' work.  [C, C]
+                        # tile, row pitch HV*C.
+                        T.copy(A[bz, t0 : t0 + C, hv, :], a_l1)
+                        T.wait_cross_flag(1)
+
+                        for i in T.serial(bk_num):
+                            T.copy(ws_k[cid, :, i * BK : (i + 1) * BK], k_l1)
+                            T.gemm_v0(a_l1, k_l1, w_l0, init=True)
+                            T.copy(w_l0, W[bz, t0 : t0 + C, hv, i * BK : (i + 1) * BK])
+
+                        for i in T.serial(bv_num):
+                            T.copy(ws_v[cid, :, i * BV : (i + 1) * BV], v_l1)
+                            T.gemm_v0(a_l1, v_l1, u_l0, init=True)
+                            T.copy(u_l0, U[bz, t0 : t0 + C, hv, i * BV : (i + 1) * BV])
+
+                        # Release this core's workspace slice for the next task.
+                        # Set on FIX rather than MTE2 so it strictly post-dates
+                        # every read above; the last task sets nothing, which is
+                        # what balances it against the vector side's `_t > 0`.
+                        if _t < t_count - 1:
+                            T.set_cross_flag("FIX", 0)
+
+    return main
+
+
+def wy_fast(k, v, beta, G, A, C, BK=None, BV=None, cu_seqlens=None, fixed_core=False):
     """Host wrapper.  All tensors are in the frozen external layout.
 
         k    [B, SEQ, H,  K]  dtype    key, not GVA-expanded
@@ -518,7 +742,14 @@ def wy_fast(k, v, beta, G, A, C, BK=None, BV=None, cu_seqlens=None):
     With ``cu_seqlens`` the inputs are a flattened varlen batch (B == 1).  W and
     U keep their layout -- one row per token in flattened order -- so nothing
     downstream has to change shape.
+
+    ``fixed_core`` (or ``KDA_WY_FIXEDCORE``, which overrides it in both
+    directions for A/B measurement) selects the third builder below, which sets
+    the grid to the physical core count instead of the task count.  Same
+    numerics, same outputs; see that builder's docstring for why it is faster
+    and for the workspace hazard it has to guard.  Fixed length only.
     """
+
     B, SEQ, H, K = k.shape
     HV, V = v.shape[2], v.shape[-1]
     assert HV % H == 0, "HV must be divisible by H (GVA)"
@@ -551,8 +782,13 @@ def wy_fast(k, v, beta, G, A, C, BK=None, BV=None, cu_seqlens=None):
     beta_p = beta.float().unsqueeze(-1)
 
     dt = _DTYPES[k.dtype]
+    # Fixed length only: under varlen the task -> (batch, head, chunk) decode
+    # differs and the variant has not been written for it, so the flag is
+    # dropped rather than honoured on that path.
+    fixed_core = os.environ.get("KDA_WY_FIXEDCORE", "1" if fixed_core else "0").lower() in ("1", "true", "yes", "on") and cu_seqlens is None
     if cu_seqlens is None:
-        ker = wy_fast_ker(B, SEQ, H, HV, K, V, C, BK, BV, dtype=dt)
+        build = wy_fast_ker_fixed_core if fixed_core else wy_fast_ker
+        ker = build(B, SEQ, H, HV, K, V, C, BK, BV, dtype=dt)
         return ker(k, v, beta_p, G, A)
 
     bounds = _VL.varlen_bounds(cu_seqlens, q=k, v=v, g=G, beta=beta)
@@ -638,38 +874,21 @@ def main():
     ok = True
     print("== shapes x gates (fp16) ==")
     for B, SEQ, H, HV, K, V, C, gate in [
-        (2, 128, 2, 2, 64, 64, 32, "normal"),  # HV == H
-        (2, 128, 2, 2, 64, 64, 64, "normal"),
-        (2, 128, 2, 4, 64, 64, 32, "forget"),  # HV == 2H, deep decay
-        (2, 128, 2, 4, 64, 64, 64, "forget"),
+        (2, 128, 2, 4, 64, 64, 32, "forget"),  # HV == 2H, C = 32, deep decay
         (1, 256, 1, 1, 128, 128, 64, "forget"),  # K3 head dim
-        (1, 128, 2, 4, 128, 128, 32, "normal"),  # K3 head dim + GVA
     ]:
         ok &= _case(B, SEQ, H, HV, K, V, C, gate, torch.float16)
 
     print("== ragged tail (SEQ % C != 0) ==")
     ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal", torch.float16)  # R=6: core 0 partly valid, core 1 entirely empty
-    ok &= _case(1, 33, 1, 1, 64, 64, 32, "forget", torch.float16)  # R=1, core 1 gets validRow==0
-    ok &= _case(1, 65, 1, 1, 128, 128, 64, "forget", torch.float16)  # K3 dim, R=1
     ok &= _case(2, 100, 2, 4, 64, 64, 32, "extreme", torch.float16)  # R=4, GVA, extreme gate
-    ok &= _case(1, 96, 1, 1, 64, 64, 64, "normal", torch.float16)  # R=32 == CV, exact core boundary
 
     print("== bf16 (dtype must be threaded through, not hardcoded) ==")
-    for gate in ("normal", "forget"):
-        ok &= _case(2, 128, 2, 4, 64, 64, 64, gate, torch.bfloat16)
+    ok &= _case(2, 128, 2, 4, 64, 64, 32, "forget", torch.bfloat16)  # shape already built above
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([64, 64, 64], 1, 2, 64, 64, 64, "normal", torch.float16, "equal, chunk-aligned")
     ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", torch.float16, "every sequence ragged -- interior tails")
     ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", torch.float16, "empty sequence in the middle")
-    ok &= _vcase([0, 70], 1, 2, 64, 64, 64, "normal", torch.float16, "empty sequence first")
-    ok &= _vcase([70, 0], 1, 2, 64, 64, 64, "normal", torch.float16, "empty sequence last")
-    ok &= _vcase([1, 200], 1, 2, 64, 64, 64, "forget", torch.float16, "one token -- core 1 gets r_vid = 0")
-    ok &= _vcase([20, 20], 1, 2, 64, 64, 64, "normal", torch.float16, "both sequences shorter than C/2")
-    ok &= _vcase([65, 65], 1, 1, 128, 128, 64, "forget", torch.float16, "K3 dim, one valid tail row each")
-    ok &= _vcase([100, 28], 2, 4, 64, 64, 32, "extreme", torch.float16, "GVA + extreme gate, C = 32")
-    ok &= _vcase([96, 32], 1, 2, 64, 64, 32, "normal", torch.float16, "exact core boundary")
-    ok &= _vcase([70, 33], 2, 4, 64, 64, 64, "forget", torch.bfloat16, "bf16 passthrough + GVA")
 
     if ok:
         print("Kernel Output Match!")

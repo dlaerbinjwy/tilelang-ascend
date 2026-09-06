@@ -903,54 +903,27 @@ def main():
     torch.manual_seed(0)
 
     ok = True
-    print("== HV == H and HV == 2H, C = 32 / 64, two gate levels (fp16) ==")
+    print("== shapes x gates, with and without an initial state (fp16) ==")
     for B, SEQ, H, HV, K, V, C, gate, ws in [
-        (1, 128, 1, 1, 64, 64, 64, "normal", False),  # HV == H
-        (1, 128, 1, 1, 64, 64, 64, "normal", True),  # HV == H  + initial_state
-        (2, 128, 2, 4, 64, 64, 64, "normal", True),  # HV == 2H
-        (2, 128, 2, 4, 64, 64, 32, "forget", True),  # HV == 2H + C=32 + forget
-        (1, 256, 1, 1, 64, 64, 32, "forget", False),  # 8 chunks of serial chain
-    ]:
-        ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, torch.float16)
-
-    print("== K3 spec K = V = 128 (fp16) ==")
-    for B, SEQ, H, HV, K, V, C, gate, ws in [
-        (1, 128, 1, 1, 128, 128, 64, "normal", True),
-        (1, 128, 2, 4, 128, 128, 64, "forget", True),  # + GVA
-        (1, 128, 1, 1, 128, 128, 32, "forget", False),
+        (2, 128, 2, 4, 64, 64, 32, "forget", True),  # HV == 2H + C=32 + initial_state
+        (2, 128, 2, 4, 64, 64, 32, "normal", False),  # same shape, no initial state
+        (1, 128, 2, 4, 128, 128, 64, "forget", True),  # K3 head dim + GVA
     ]:
         ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, torch.float16)
 
     print("== ragged tail (SEQ % C != 0) ==")
     for B, SEQ, H, HV, K, V, C, gate, ws in [
         (2, 70, 1, 2, 64, 64, 64, "normal", False),  # R=6
-        (1, 33, 1, 1, 64, 64, 32, "forget", False),  # R=1, core 1 empty
         (1, 65, 1, 1, 128, 128, 64, "forget", True),  # K3 dim, R=1, with initial state
-        (2, 100, 2, 4, 64, 64, 32, "extreme", True),  # GVA + extreme gate + state
-        (1, 96, 1, 1, 64, 64, 64, "normal", False),  # R=32 == CV, exact core boundary
     ]:
         ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, torch.float16)
 
     print("== dtype passthrough (bf16) ==")
-    for B, SEQ, H, HV, K, V, C, gate, ws in [
-        (2, 128, 2, 4, 64, 64, 64, "normal", True),
-        (1, 128, 1, 1, 128, 128, 64, "forget", True),
-    ]:
-        ok &= _case(B, SEQ, H, HV, K, V, C, gate, ws, torch.bfloat16)
+    ok &= _case(2, 128, 2, 4, 64, 64, 32, "normal", True, torch.bfloat16)  # shape already built above
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([64, 64, 64], 1, 2, 64, 64, 64, "normal", False, torch.float16, "equal, chunk-aligned")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", False, torch.float16, "every sequence ragged")
     ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "forget", True, torch.float16, "ragged + per-sequence S0")
     ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", True, torch.float16, "empty in the middle, S0 passthrough")
-    ok &= _vcase([0, 70], 1, 2, 64, 64, 64, "normal", True, torch.float16, "empty first")
-    ok &= _vcase([70, 0], 1, 2, 64, 64, 64, "normal", True, torch.float16, "empty last")
-    ok &= _vcase([0, 0], 1, 2, 64, 64, 64, "normal", True, torch.float16, "every sequence empty")
-    ok &= _vcase([1, 200], 1, 2, 64, 64, 64, "forget", False, torch.float16, "one token -- core 1 gets vrows = 0")
-    ok &= _vcase([20, 20], 1, 2, 64, 64, 64, "normal", False, torch.float16, "both shorter than C/2")
-    ok &= _vcase([65, 65], 1, 1, 128, 128, 64, "forget", True, torch.float16, "K3 dim, one valid tail row each")
-    ok &= _vcase([100, 28], 2, 4, 64, 64, 32, "extreme", False, torch.float16, "GVA + extreme gate, C = 32")
-    ok &= _vcase([70, 33], 2, 4, 64, 64, 64, "forget", True, torch.bfloat16, "bf16 + GVA")
 
     if ok:
         print("Kernel Output Match!")

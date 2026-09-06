@@ -32,13 +32,13 @@ stage 5 carries the state serially across chunks, stage 6 reads it back.
 |:-:|---|---|---|:-:|
 | 1 | `chunk_cumsum` | `kda_chunk_cumsum.py` | $\Gamma_{t,d}=\sum_{s=t_0}^{t}g_{s,d}$, restarted at every chunk boundary | Vector |
 | 2 | `chunk_scaled_dot_kkt` | `kda_chunk_scaled_dot_kkt.py` | $L_{ij}=\beta_i\sum_d k_{i,d}k_{j,d}\,e^{\Gamma_{i,d}-\Gamma_{j,d}}$ for $j<i$ | Vector + Cube |
-| 3 | `solve_tril` | `kda_solve_tril.py` -> `kda_solve_tril_cube.py` | $\mathbf A=(\mathbf I+\mathbf L)^{-1}$ by a doubling Neumann series on the cube; the row-wise forward substitution is the fp32 / $C<16$ fallback | Vector + Cube |
+| 3 | `solve_tril` | `kda_solve_tril.py` | $\mathbf A=(\mathbf I+\mathbf L)^{-1}$ by a doubling Neumann series on the cube; the row-wise forward substitution in the same file is the fp32 / $C<16$ fallback | Vector + Cube |
 | 4 | `wy_fast` | `kda_wy_fast.py` | UT transform: $\mathbf U=\mathbf A\,\mathrm{Diag}(\beta)\mathbf V$, $\mathbf W=\mathbf A\,\mathrm{Diag}(\beta)(\mathbf K\odot e^{\Gamma})$ | Vector + Cube |
 | 5 | `chunk_h` | `kda_chunk_h.py` | $\mathbf V'=\mathbf U-\mathbf W\mathbf S$, then $\mathbf S\leftarrow\mathrm{Diag}(e^{\Gamma_C})\mathbf S+\mathrm{kg}^{\top}\mathbf V'$ with $\mathrm{kg}=\mathbf K\odot e^{\Gamma_C-\Gamma}$ | Vector + Cube |
 | 6 | `chunk_o` | `kda_chunk_o.py` | $\mathbf O=(s\mathbf Q\odot e^{\Gamma})\mathbf S_n+\mathbf A^{qk}\mathbf V'$, $A^{qk}_{ij}=\sum_d q_{i,d}k_{j,d}e^{\Gamma_{i,d}-\Gamma_{j,d}}$ for $j\le i$ | Vector + Cube |
 
 The pipeline contains sixteen `T.gemm_v0` calls on the default path: one in
-`chunk_scaled_dot_kkt`, eight in `solve_tril_cube`, two in `wy_fast`, two in
+`chunk_scaled_dot_kkt`, eight in `solve_tril`, two in `wy_fast`, two in
 `chunk_h`, three in `chunk_o`. Only stage 1 has none.
 
 * **Stage 2 is not a matmul in its natural form.** With a
@@ -51,7 +51,8 @@ The pipeline contains sixteen `T.gemm_v0` calls on the default path: one in
   cube anyway -- the same construction stage 6 uses, described next -- which is
   what moved this stage from 19.1% to 67.6% of the reference (`bench_mark.md`).
   The diagonal blocks are the part that stays on the vector cores, and `route_b`
-  moves those too.
+  moves those too -- in this stage and in stage 6, which uses the same
+  construction.
 * **Stage 6 recovers the Cube by anchored blocking.** Each block of `BC = 16`
   rows is anchored at its first row; on the strictly-below-anchor columns both
   folded factors $e^{\Gamma_i-\Gamma_{ar}}$ and $e^{\Gamma_{ar}-\Gamma_j}$ are
@@ -61,7 +62,14 @@ The pipeline contains sixteen `T.gemm_v0` calls on the default path: one in
   deliberately contains no chunk axis; the state stays resident in UB across the
   whole `T.serial(N)` loop.
 * Stages 4–6 hand operands from Vector to Cube through GM workspaces guarded by
-  `set_cross_flag` / `wait_cross_flag`, because there is no UB → L1 path on 910B.
+  `set_cross_flag` / `wait_cross_flag`. A `copy_ub_to_l1` template does exist
+  (`src/tl_templates/ascend/common.h`, `half` only), but nothing in the language
+  surface reaches it: a `T.copy` from a UB buffer to an L1 buffer lowers to
+  `copy_ub_to_gm` followed by `copy_gm_to_l1`. Checked by dumping the generated
+  AscendC for a kernel that writes UB straight into L1 -- the emitted count of
+  `copy_ub_to_l1` is zero. So a Vector to Cube handoff costs a GM round trip
+  whether or not the two halves live in the same kernel, which is why fusing
+  stages would not remove one.
 
 ---
 
@@ -141,7 +149,6 @@ linear_attention_and_rnn/
     ├── kda_chunk_cumsum.py        # stage 1  + self-test
     ├── kda_chunk_scaled_dot_kkt.py# stage 2  + self-test
     ├── kda_solve_tril.py           # stage 3 dispatch  + self-test
-    ├── kda_solve_tril_cube.py      # stage 3 on the cube (doubling Neumann)
     ├── kda_wy_fast.py             # stage 4  + self-test
     ├── kda_chunk_h.py             # stage 5  + self-test
     ├── kda_chunk_o.py             # stage 6  + self-test
@@ -349,6 +356,30 @@ is exact, $e_{\text{sens}}=0$, and the criterion tightens to `1e-5` on its own.
 
 ---
 
+## Environment switches
+
+Four, all opt-in, none of them changing the default: with nothing set the
+operator runs the numerics it shipped with. They exist so an A/B can be taken
+without editing source, which is how every figure in `bench_mark.md` was
+produced.
+
+All four parse the same way -- `1` / `true` / `yes` / `on`, case-insensitively --
+so an unrecognised value means *off*. That is the safe direction in both places
+it matters: an opt-in approximation stays off, and a cube path that has an exact
+fallback falls back.
+
+| Switch | Default | Read at | Effect |
+|---|---|---|---|
+| `KDA_ROUTE_B` | off | call time | Overrides the `route_b` argument in both directions. Forced off under `cu_seqlens`, and asking for it there warns rather than silently returning the route A result. |
+| `KDA_WY_FIXEDCORE` | off | call time | Overrides `wy_fast`'s `fixed_core` argument. Stage 4 with the grid set to the physical core count; worth 192.3u on that stage at `H = 96`. Fixed length only. |
+| `KDA_SOLVE_CUBE` | **on** | call time | Stage 3's cube solver. Off falls back to the row-wise forward substitution in the same file, which is also the fp32 path. |
+| `KDA_SOLVE_STEPS` | `2` | import time | Doubling steps in stage 3's Neumann series, 1 to 3. The default covers `L^7` and is measured, not picked: `1` (covering `L^3`) fails the keep gate in the pipeline at 8.260e-03 against a 5e-3 tolerance. |
+
+`route_b` and `fixed_core` are also plain keyword arguments -- `kda_chunk_fwd`
+forwards `route_b` to stages 2 and 6, and `wy_fast` takes `fixed_core` -- so a
+caller never has to reach for the environment. The variables exist for the
+benchmark harness, which has to flip a caller it does not control.
+
 ## Status and what is not done
 
 * **Performance is measured, not claimed.** Every figure in `bench_mark.md`
@@ -361,8 +392,8 @@ is exact, $e_{\text{sens}}=0$, and the criterion tightens to `1e-5` on its own.
   reduction, so the fill is load-bearing rather than tidy. `cu_seqlens` goes
   through `kda_varlen.py`, and a batched varlen run is asserted bit-identical to
   running each sequence on its own.
-* **`route_b` is off by default.** It puts stage 2's diagonal blocks on the cube
-  and is worth 2.3x on that stage, but it saturates a gate that spans more than
+* **`route_b` is off by default.** It puts the diagonal blocks of stages 2 and 6
+  on the cube and is worth 2.3x on stage 2 and 2.4x on stage 6, but it saturates a gate that spans more than
   its clamp inside one block, so it is opt-in rather than automatic. The
   approximation itself is not unusual -- the reference makes the same one, and
   harder: it clamps the same exponent two-sided at 55.45 nats
@@ -379,16 +410,43 @@ is exact, $e_{\text{sens}}=0$, and the criterion tightens to `1e-5` on its own.
   its Cube-to-Vector scratch by physical core count rather than by logical task
   count, and that was tried here: the grid becomes the core count and each core
   walks its own slice of the tasks, which brings the six stages' workspaces from
-  1.57 GB to 5.1 MB at `H = 96`. Measured, it is worth 3.7% on stage 2 and 1.1%
-  on the pipeline -- real, and not the gap.
+  1.57 GB to 5.1 MB at `H = 96`. Stage 4 ships it behind `KDA_WY_FIXEDCORE` and it
+  is worth 192.3u there, 11.3% of that stage.
+
+  The reason it pays is not the workspace size. Stage 4's grid is
+  `B * HV * chunk_num`, 6144 blocks at `H = 96`, and each block runs about 277 ns
+  against a per-block prologue -- nine `GlobalTensor` and five `TBuf`
+  constructions -- of about 164 ns, all of it on the scalar unit. The generated
+  kernel is 131 lines and contains no `GetValue`: the work is not scalar, the
+  *setup* is, and Fixed Core pays it once per core instead of once per task.
+  Across the six stages that setup is 4561u of 14459u at `H = 96`, so the same
+  change applies to the other five and has not been made.
+
+  One caution for whoever does them. Under Fixed Core a workspace slice belongs to
+  the CORE, not to the task, so a core that walks more than one task overwrites
+  what the previous one published. A single Vector-to-Cube flag is not enough; a
+  back-edge is needed so the cube can say it has finished reading, with the two
+  counts balanced exactly or the kernel deadlocks. Without it the failure is
+  intermittent and shape-dependent: it appears only once the task count exceeds
+  the core count, so a suite whose cases are all smaller than 20 tasks passes it.
 * **The gap is software pipelining.** The reference ships two configurations:
   `safeGate = 1` carries a 4-deep pipelined triangular solve and a
   software-pipelined task loop, and runs 1.76x faster than its own
   `safeGate = 0` fallback at `H = 96` while agreeing with it to fp16
-  quantisation. This implementation has no software pipelining anywhere --
-  neither `num_stages` nor double buffering nor a reduced inter-core sync
-  frequency, which are items 3, 5 and 6 of the optimization list in
-  `examples/flash_attention/fa_opt/bench_mark.md`. That is the next thing to
-  try here.
+  quantisation.
+
+  Double buffering was tried on both halves of stage 6 and neither arm is worth
+  shipping, which is itself the useful result. On the cube side it is correct and
+  gains nothing -- that half runs at 4.2% mac occupancy and has the slack to
+  absorb its own stalls. On the vector side it gains 63u but does not fit UB at
+  `K = 128`.
+
+  What the generated code shows is more useful than either number. All eighteen
+  `SetFlag` / `WaitFlag` pairs in that kernel are a set followed immediately by
+  its own wait, so nothing overlaps anything by construction. Rebuilding the
+  stage with the sync inserter switched off -- numerically wrong, but it times
+  the barriers -- runs it at 2785.6u against 4024.0u at `H = 96`, so 30.8% of the
+  stage is synchronisation. Capturing that needs the flags placed by hand, not a
+  second buffer, and that is the next thing to try.
 
 * Backward is not part of this directory.

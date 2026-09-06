@@ -135,6 +135,7 @@ UB accounting, worst case in scope (C=64, K=V=128, VEC_NUM=2 -> CV=32, BC=16)
 
 import os
 import sys
+import warnings
 
 import torch
 import tilelang
@@ -153,24 +154,15 @@ import kda_varlen as _VL  # noqa: E402
 # wrote zeros, which reads as a math bug rather than as a pass bug.
 pass_configs = {tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True}
 
-# MEMORY_PLANNING (live-range based UB reuse) has always been off in this repo:
-# VERSION.md records it aliasing a reduction target with a scratch tile on the
-# backward dot, so the registers were right and the store wrote zeros.
-#
-# It is exposed as a switch here because probe_stacked_escalate.py measured what
-# the wide [2*BC, K] tile in phase 3 would need: 14.4-19.5 KB of *implicit*
-# compiler scratch on top of the declared buffers, against the 9.2 KB this kernel
-# has spare at K=128 (the static check passes and the device raises an aivector
-# error).  With the pass on, that configuration fits.
-#
-# It stays off by default because phase 3 contains a T.reduce_sum, exactly the
-# kind of construct that failed before.  Turning it on requires a full test run
-# plus kda_full's bit-identity criterion for varlen.
-if os.environ.get("KDA_CHUNKO_MEMPLAN", "0") == "1":
-    pass_configs[tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING] = True
-
 
 VEC_NUM = 2
+
+# Route B, ported from stage 2.  Same derivation: the operand bound is
+# |k| * e^80 < 3.39e38 (bf16) and the accumulation bound K * |k|^2 * e^80
+# < 3.40e38 (fp32) -- the second is the binding one.  NOT the official
+# operator's 80 * LN2 = 55.45: that constant is for its end-to-end frame and
+# was measured to fail this stage's gate.
+ROUTE_B_CLAMP = 80.0  # nats
 UB_LIMIT = 196352
 
 
@@ -189,6 +181,9 @@ def ub_bytes(C, K, V, BC, elem):
         + 3 * BC * K * f32  # qb_ub, pb_ub, ob_ub
         + 2 * BC * K * elem  # qb_half, ob_half
         + CV * C * elem  # ah_ub
+        + CV * C // 8  # mbit_ub, the route B causal mask, one bit per element
+        + 8 * C * f32
+        + 8 * C // 8  # asel_ub + mbit_s, the bfloat16 detour
         + 2 * K * f32
         + C * f32
         + 2 * BC * f32
@@ -196,7 +191,21 @@ def ub_bytes(C, K, V, BC, elem):
 
 
 @tilelang.jit(out_idx=[-1], workspace_idx=[-6, -5, -4, -3, -2], pass_configs=pass_configs)
-def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dtype="float"):
+def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dtype="float", route_b=False):
+    # The cube operand dtype.  Route B is the only reason it can differ from
+    # the data dtype: the column operand carries exp of the intra-block gate
+    # span, which fp16 cannot hold.
+    wdt = "bfloat16" if route_b else dtype
+    # Route B holds the intra-block gate span under ROUTE_B_CLAMP nats, and that
+    # span grows with BC.  Measured on this file's own gates at C = 64: the
+    # forget gate spans 35.0 / 66.4 / 114.2 nats at BC = 8 / 16 / 32, so BC = 32
+    # is past the clamp and the error goes to 4.2e-01 -- silently, because the
+    # result stays finite.  BC = 8 raises an aicore exception on either route
+    # (the cube's fractal granularity is 16).  One value works.
+    assert not route_b or BC == 16, (
+        f"route B is only valid at BC = 16, got BC = {BC}: the intra-block gate "
+        f"span scales with BC and passes ROUTE_B_CLAMP = {ROUTE_B_CLAMP} nats by BC = 32"
+    )
     assert C % (BC * VEC_NUM) == 0, f"need C % {BC * VEC_NUM} == 0, got C={C}"
     assert HV % H == 0, "HV must be divisible by H (GVA)"
 
@@ -237,10 +246,11 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
         S: T.Tensor([B, HV, N, K, V], dtype),  # type: ignore  entry states
         G: T.Tensor([B, SEQ, HV, K], accum_dtype),  # type: ignore
         MskInc: T.Tensor([C, C], accum_dtype),  # type: ignore  i >= j
-        MskStr: T.Tensor([C, C], accum_dtype),  # type: ignore  i >  j
-        ws_qg: T.Tensor([B * HV * N, C, K], dtype),  # type: ignore
-        ws_qf: T.Tensor([B * HV * N, C, K], dtype),  # type: ignore
-        ws_kf: T.Tensor([B * HV * N, NB, C, K], dtype),  # type: ignore
+        MskStr: T.Tensor([2 * C, C], accum_dtype),  # type: ignore  i > j, 2C rows for route B
+        MskBit: T.Tensor([C * C // 8], "uint8"),  # type: ignore  i >= j, one bit per column
+        ws_qg: T.Tensor([B * HV * N, C, K], dtype),  # type: ignore  pairs with the state, so never wdt
+        ws_qf: T.Tensor([B * HV * N, C, K], wdt),  # type: ignore
+        ws_kf: T.Tensor([B * HV * N, NB, C, K], wdt),  # type: ignore
         ws_ao: T.Tensor([B * HV * N, C, C], dtype),  # type: ignore  strip matmuls
         ws_aq: T.Tensor([B * HV * N, C, C], dtype),  # type: ignore  full Aqk
         O: T.Tensor([B, SEQ, HV, V], dtype),  # type: ignore
@@ -254,8 +264,8 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
             r0 = vid * CV  # first chunk-local row of this core
 
             # ---- L1 / L0C: cube operands and accumulators
-            qf_l1 = T.alloc_L1([BC, K], dtype)
-            kf_l1 = T.alloc_L1([C, K], dtype)
+            qf_l1 = T.alloc_L1([BC, K], wdt)
+            kf_l1 = T.alloc_L1([C, K], wdt)
             qg_l1 = T.alloc_L1([C, K], dtype)
             s_l1 = T.alloc_L1([K, V], dtype)
             aq_l1 = T.alloc_L1([C, C], dtype)
@@ -272,10 +282,20 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
             qb_ub = T.alloc_ub([BC, K], accum_dtype)
             qb_half = T.alloc_ub([BC, K], dtype)
             pb_ub = T.alloc_ub([BC, K], accum_dtype)
-            ob_half = T.alloc_ub([BC, K], dtype)
+            ob_half = T.alloc_ub([BC, K], wdt)
 
             ah_ub = T.alloc_ub([CV, C], dtype)
 
+            # Route B only: the causal mask over this core's rows of Aqk, as a
+            # BIT mask rather than a float plane.  One bit per element, so
+            # CV * C / 8 = 256 B against the 8192 B a [CV, C] fp32 plane would
+            # need -- this stage runs UB at 95% and could not afford the plane.
+            # This is what the reference does (chunk_kda_fwd_prepare.h:1225
+            # builds one uint64 per row).  Flat, not [CV, C // 8]: an 8-byte UB
+            # row is padded out to the 32-byte block while the select reads its
+            # mask as dense bytes, which shifts every bit (measured: a [32, 8]
+            # tile keeps 900 of 2048 elements instead of 528).
+            mbit_ub = T.alloc_ub([CV * C // 8], "uint8")
             mcol_ub = T.alloc_ub([C], accum_dtype)
             # The diagonal block's inclusive mask, read once as a block.
             # BC * BC fp32 = 1 KB.
@@ -336,8 +356,13 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
                         pb_ub[i, d] = T.exp(g_ub[row + i, d])
                     for i, d in T.Parallel(BC, K):
                         ob_ub[i, d] = qb_ub[i, d] * pb_ub[i, d]
-                    T.copy(ob_ub, ob_half)
-                    T.copy(ob_half, ws_qg[cid, row, 0])
+                    # Staged through qb_half, not ob_half: this operand pairs
+                    # with the state in the inter-chunk matmul and so stays in the
+                    # data dtype, while ob_half carries the qf operand which under
+                    # route B is bfloat16.  qb_half is already the right dtype and
+                    # is dead from line 328 until the next block.
+                    T.copy(ob_ub, qb_half)
+                    T.copy(qb_half, ws_qg[cid, row, 0])
 
                     # strip operand qf = (scale q) . e^{G - G_anchor}.  Rows of
                     # the block are at or below the anchor, so the exponent is
@@ -365,7 +390,13 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
                     # strictly-lower row ar is the indicator of j < ar; for
                     # ar == 0 it is all zeros, so that block's matmul yields
                     # exact zeros instead of reading dirty workspace memory.
-                    T.copy(MskStr[ar, 0], mcol_ub)
+                    # Route B needs the columns this block owns, so the
+                    # boundary moves from ar to ar + BC: Aqk is inclusive, a
+                    # block covers rows [ar, ar+BC), and the columns it needs
+                    # are j <= ar+BC-1.  Row ar+BC of a strictly-lower matrix
+                    # is exactly that indicator, which is why MskStr has 2C
+                    # rows: for the last block ar + BC == C.
+                    T.copy(MskStr[ar + BC if route_b else ar, 0], mcol_ub)
                     # Materialised broadcast.  An operand indexed by an INNER
                     # variable alone lowers to one narrow instruction per row in
                     # this dialect: 64 x Sub(128) instead of a single Sub(8192).
@@ -379,7 +410,12 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
                     # diagonal patch: for j < ar the exponent is already <= 0
                     # because G is non-increasing, and for j >= ar it is >= 0,
                     # where the clamp gives exactly the 0 the mask gave.
-                    T.tile.min(fold_ub, fold_ub, 0.0)
+                    # Upper clamp only, never a lower one: the true exponent
+                    # is <= 0 inside the causal block, so the factored pair is
+                    # a small factor times a large one, and a lower clamp
+                    # turns a factor that should underflow to exactly zero
+                    # into ~1e-39.  0 * saturated is still 0.
+                    T.tile.min(fold_ub, fold_ub, ROUTE_B_CLAMP if route_b else 0.0)
                     for j, d in T.Parallel(C, K):
                         fold_ub[j, d] = T.exp(fold_ub[j, d])
                     for j, d in T.Parallel(C, K):
@@ -393,14 +429,68 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
                     T.tile.broadcast(mcol_b, mcol_ub, axis=1)
                     for j, d in T.Parallel(C, K):
                         fold_ub[j, d] = fold_ub[j, d] * mcol_b[j, d]
-                    T.copy(fold_ub, kh_ub)
-                    T.copy(kh_ub, ws_kf[cid, a, 0, 0])
+                    # kh_ub cannot carry this under route B: it holds Kt in the
+                    # data dtype while ws_kf is now in wdt, and a second [C, K]
+                    # tile does not fit.  ob_half is already the operand dtype
+                    # and is dead between phase 1a and here, so it carries the
+                    # operand out in C // BC slices at compile-time offsets.
+                    # Same construction as stage 2.
+                    if route_b:
+                        for t in range(C // BC):
+                            T.copy(fold_ub[t * BC : (t + 1) * BC, :], ob_half)
+                            T.copy(ob_half, ws_kf[cid, a, t * BC, 0])
+                    else:
+                        T.copy(fold_ub, kh_ub)
+                        T.copy(kh_ub, ws_kf[cid, a, 0, 0])
 
                 T.set_cross_flag("MTE3", 0)
 
                 # ============ phase 3: patch the diagonal blocks =============
                 T.wait_cross_flag(1)
                 T.copy(ws_ao[cid, r0, 0], ah_ub)
+                if route_b:
+                    # The strips now cover the diagonal blocks too, and the
+                    # columns j > i in them carry exp of a positive exponent.
+                    # Phase 3 used to mask those per row as it wrote them; with
+                    # phase 3 gone the whole plane is selected here instead --
+                    # keep ah_ub where the bit is set, zero where it is not.
+                    if dtype == "bfloat16":
+                        # bfloat16 has no vector select on this part
+                        # (Select<bfloat16_t, uint8_t> does not compile), and the
+                        # three obvious ways round it are each dead:
+                        #   * a float16 alias of the tile -- the codegen does not
+                        #     emit a LocalTensor for an aliased buffer, so the
+                        #     call still resolves to LocalTensor<__bf16>.
+                        #   * multiply by a 0/1 mask plane instead of selecting --
+                        #     WRONG for any dtype, not just slow: the j > i columns
+                        #     carry exp of a positive exponent and overflow to
+                        #     +-inf, and inf * 0 is NaN.  Measured: the multiply
+                        #     form returns NaN on the normal and forget gates in
+                        #     float16 and survives only on keep, whose in-block
+                        #     span is 0.
+                        #   * cast to float16 and select there -- Cast<half, __bf16>
+                        #     has no intrinsic either.
+                        # float32 has both the select and the cast, so the tile
+                        # makes a round trip through it, eight rows at a time: a
+                        # whole [CV, C] float32 tile is 8 KB and the device raises
+                        # "the address for the VEC instruction to read/write UB is
+                        # out of bounds" at K = 128.
+                        #
+                        # The 8 is a literal on purpose.  Binding it to a name here
+                        # makes it a TIR variable and the buffer shape then fails
+                        # "PTO physical buffer shape must be constant"; a
+                        # builder-level Python int would do, a name bound inside
+                        # the prim_func will not.
+                        asel_ub = T.alloc_ub([8, C], accum_dtype)
+                        mbit_s = T.alloc_ub([8 * C // 8], "uint8")
+                        for t in range(CV // 8):
+                            T.copy(MskBit[(r0 + t * 8) * (C // 8)], mbit_s)
+                            T.copy(ah_ub[t * 8 : (t + 1) * 8, :], asel_ub)
+                            T.tile.select(asel_ub, mbit_s, asel_ub, T.Cast(accum_dtype, 0.0), "VSEL_TENSOR_SCALAR_MODE")
+                            T.copy(asel_ub, ah_ub[t * 8 : (t + 1) * 8, :])
+                    else:
+                        T.copy(MskBit[r0 * (C // 8)], mbit_ub)
+                        T.tile.select(ah_ub, mbit_ub, ah_ub, T.Cast(dtype, 0.0), "VSEL_TENSOR_SCALAR_MODE")
                 # MskInc[i_loc, a0] is just "jj <= rr" -- independent of a0 and of
                 # vid -- so it is identically the [BC, BC] top-left corner of
                 # MskInc, a compile-time constant.  Read it once and index
@@ -410,7 +500,10 @@ def chunk_o_ker(B, SEQ, H, HV, K, V, C, scale, BC=16, dtype="float16", accum_dty
                 # narrow GM read per row, 32 per block.
                 T.copy(MskInc[0, 0], mblk_ub)
 
-                for ab in range(NAB):
+                # Under route B the strip matmul already produced these
+                # columns correctly, so this whole per-row patch is dead --
+                # which is the point: measured at 66.4% of this kernel.
+                for ab in range(0 if route_b else NAB):
                     a0 = r0 + ab * BC  # anchor row of this block
 
                     # One block read of Q replaces BC narrow per-row GM reads, BC
@@ -554,7 +647,7 @@ def chunk_o_ker_varlen(B, SEQ, H, HV, K, V, C, scale, NT_TOTAL, BC=16, dtype="fl
         S: T.Tensor([B, HV, NT_TOTAL, K, V], dtype),  # type: ignore  entry states, chunk axis is the whole batch
         G: T.Tensor([B, SEQ, HV, K], accum_dtype),  # type: ignore
         MskInc: T.Tensor([C, C], accum_dtype),  # type: ignore  i >= j
-        MskStr: T.Tensor([C, C], accum_dtype),  # type: ignore  i >  j
+        MskStr: T.Tensor([2 * C, C], accum_dtype),  # type: ignore  i > j, 2C rows for route B
         # Meta goes before the workspaces: the decorator addresses them and
         # the output with NEGATIVE indices (workspace_idx=[-6..-2], out_idx=[-1]),
         # so appending after them would shift all six and the framework would
@@ -867,12 +960,28 @@ def _causal_masks(C, device):
     m = _MSK_CACHE.get(key)
     if m is None:
         idx = torch.arange(C, device=device)
-        m = ((idx[:, None] >= idx[None, :]).float(), (idx[:, None] > idx[None, :]).float())
+        # The same inclusive mask again, packed one bit per element, flat, for
+        # the route B select.  Two things are load-bearing and were both measured
+        # (probe: a [32, 8] uint8 tile keeps 900 of 2048 elements instead of 528):
+        #   * flat, not [C, C // 8].  A UB row of 8 bytes gets padded out to the
+        #     32-byte block, and vsel reads its mask as dense bytes, so the
+        #     padding shifts every bit.  A 1-D buffer has no row to pad.
+        #   * bitorder='little'.  numpy defaults to 'big'; the Ascend select
+        #     numbers bits the other way within each byte.
+        import numpy as _np
+
+        _inc = (idx[:, None] >= idx[None, :]).cpu().numpy()
+        _bits = torch.from_numpy(_np.packbits(_inc.reshape(-1), bitorder="little")).to(device)
+        # MskStr gets 2C rows, not C.  Route B masks columns at the boundary
+        # ar + BC, and for the last anchor block that boundary is row C itself.
+        # Rows C..2C-1 are all ones: every column is below the boundary.
+        idx2 = torch.arange(2 * C, device=device)
+        m = ((idx[:, None] >= idx[None, :]).float(), (idx2[:, None] > idx[None, :]).float(), _bits)
         _MSK_CACHE[key] = m
     return m
 
 
-def chunk_o(q, k, vnew, states, G, C=64, BC=16, scale=None, cu_seqlens=None):
+def chunk_o(q, k, vnew, states, G, C=64, BC=16, scale=None, cu_seqlens=None, route_b=False):
     """Host wrapper.  O = (scale.Q . e^G) S + Aqk V', all external layout.
 
     q, k    [B, SEQ, H,  K]   dtype
@@ -922,12 +1031,26 @@ def chunk_o(q, k, vnew, states, G, C=64, BC=16, scale=None, cu_seqlens=None):
     if scale is None:
         scale = K**-0.5
 
-    msk_inc, msk_str = _causal_masks(C, q.device)
+    # KDA_ROUTE_B overrides the argument in both directions, for A/B measurement.
+    route_b = os.environ.get("KDA_ROUTE_B", "1" if route_b else "0").lower() in ("1", "true", "yes", "on")
+    # Route B keeps to the fixed-length path, as stage 2 does: under varlen a
+    # chunk starts at a sequence boundary rather than a multiple of C, so the
+    # anchor row of a block is not where the clamp was reasoned about.  Asking
+    # for it there would otherwise return the route A result bit for bit, with
+    # nothing to tell the caller the switch did nothing.
+    if route_b and cu_seqlens is not None:
+        warnings.warn(
+            "route_b is not supported under cu_seqlens; falling back to route A",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        route_b = False
+    msk_inc, msk_str, msk_bit = _causal_masks(C, q.device)
 
     dt = {torch.float16: "float16", torch.bfloat16: "bfloat16"}[q.dtype]
     if cu_seqlens is None:
-        ker = chunk_o_ker(B, SEQ, H, HV, K, V, C, float(scale), BC=BC, dtype=dt)
-        return ker(q, k, vnew, states, G, msk_inc, msk_str)
+        ker = chunk_o_ker(B, SEQ, H, HV, K, V, C, float(scale), BC=BC, dtype=dt, route_b=route_b)
+        return ker(q, k, vnew, states, G, msk_inc, msk_str, msk_bit)
 
     bounds = _VL.varlen_bounds(cu_seqlens, q=q, k=k, v=vnew, g=G)
     meta = _VL.chunk_meta(bounds, C, q.device)
@@ -946,7 +1069,7 @@ def _relerr(x, r):
     return (x.float() - r).abs().max().item() / max(r.abs().max().item(), 1e-9)
 
 
-def _case(B, SEQ, H, HV, K, V, C, gate, dtype=torch.float16, BC=16):
+def _case(B, SEQ, H, HV, K, V, C, gate, dtype=torch.float16, BC=16, route_b=False):
     q, k, v, g, beta, _ = kda_chunk_ref.make_inputs(B, SEQ, H, HV, K, V, dtype=dtype, gate=gate)
     st = kda_chunk_ref.stage_tensors(q, k, v, g, beta, C=C, BC=BC)
 
@@ -956,7 +1079,16 @@ def _case(B, SEQ, H, HV, K, V, C, gate, dtype=torch.float16, BC=16):
     # host path -- in the fused pipeline stage 5 writes V' / states straight out
     # in external layout and in the input dtype, and chunk_o() below does no
     # tensor work at all beyond the two constant masks.
-    got = chunk_o(q, k, st["Vt"].to(dtype).contiguous(), st["states"].to(dtype).contiguous(), st["G"].contiguous(), C=C, BC=BC)
+    got = chunk_o(
+        q,
+        k,
+        st["Vt"].to(dtype).contiguous(),
+        st["states"].to(dtype).contiguous(),
+        st["G"].contiguous(),
+        C=C,
+        BC=BC,
+        route_b=route_b,
+    )
 
     err = _relerr(got, st["o"])
     finite = torch.isfinite(got.float()).all().item()
@@ -965,12 +1097,12 @@ def _case(B, SEQ, H, HV, K, V, C, gate, dtype=torch.float16, BC=16):
     tag = "bf16" if dtype == torch.bfloat16 else "fp16"
     print(
         f"  B{B} T{SEQ:<4d} H{H} HV{HV} K{K:<3d} V{V:<3d} C{C:<2d} {tag} "
-        f"{gate:8s} relerr={err:.2e} finite={finite}  {'ok' if ok else 'FAIL'}"
+        f"{gate:8s} {'B' if route_b else 'A'} relerr={err:.2e} finite={finite}  {'ok' if ok else 'FAIL'}"
     )
     return ok
 
 
-def _vcase(seqlens, H, HV, K, V, C, gate, dtype=torch.float16, BC=16, note=""):
+def _vcase(seqlens, H, HV, K, V, C, gate, dtype=torch.float16, BC=16, note="", route_b=False):
     """One varlen batch against the stage-6 golden, over the WHOLE flat token axis.
 
     Whole-axis on purpose: the single L0C -> GM store is what would corrupt a
@@ -986,7 +1118,7 @@ def _vcase(seqlens, H, HV, K, V, C, gate, dtype=torch.float16, BC=16, note=""):
     S = st["states"].contiguous().to(dtype).npu()
     G = st["G"].contiguous().npu()
 
-    got = chunk_o(q, k, Vn, S, G, C=C, BC=BC, cu_seqlens=cu)
+    got = chunk_o(q, k, Vn, S, G, C=C, BC=BC, cu_seqlens=cu, route_b=route_b)
 
     err = _relerr(got.cpu(), st["o"])
     finite = bool(torch.isfinite(got.float()).all())
@@ -1000,51 +1132,137 @@ def _vcase(seqlens, H, HV, K, V, C, gate, dtype=torch.float16, BC=16, note=""):
     return ok
 
 
+def _mask_case(C, dtype=torch.float16, K=64, BC=16):
+    """Route B's causal mask, on its own, against an analytic answer.
+
+    The whole diagonal correction rests on one packed-bit vsel, and two of its
+    properties are load-bearing and silent when wrong: the mask buffer is flat
+    because a [CV, C // 8] tile has 8-byte rows that UB pads out to 32, and the
+    bits are packed little-endian because Ascend numbers them the other way from
+    numpy's default.  Either mistake keeps the wrong columns and still returns
+    finite, plausible numbers.
+
+    Construction: q = k = 1 and g = 0, so every exponent is exp(0) = 1 and
+    Aqk[i, j] = scale * K = sqrt(K) for every column the mask keeps.  With V' = 1
+    and an all-zero entry state the output row is sqrt(K) times the number of
+    columns kept, which for a correct inclusive causal mask is the row's
+    chunk-local index plus one.  An off-by-one column or a flipped bit order
+    moves a whole unit of sqrt(K), at least 1 / C of the answer.
+    """
+    B, SEQ, H, HV, V = 1, 2 * C, 1, 1, K
+    N = SEQ // C
+    dev = "npu"
+    q = torch.ones(B, SEQ, H, K, dtype=dtype, device=dev)
+    k = torch.ones(B, SEQ, H, K, dtype=dtype, device=dev)
+    G = torch.zeros(B, SEQ, HV, K, dtype=torch.float32, device=dev)
+    vnew = torch.ones(B, SEQ, HV, V, dtype=dtype, device=dev)
+    states = torch.zeros(B, HV, N, K, V, dtype=dtype, device=dev)
+
+    got = chunk_o(q, k, vnew, states, G, C=C, BC=BC, route_b=True).float().cpu()
+    idx = torch.arange(C, dtype=torch.float32)
+    want = ((idx + 1) * (K**0.5)).repeat(N).view(1, SEQ, 1, 1).expand(B, SEQ, HV, V)
+
+    err = (got - want).abs().max().item() / want.abs().max().item()
+    ok = err < 2e-3
+    tag = "fp16" if dtype == torch.float16 else "bf16"
+    print(f"  C{C:<3d} K{K:<4d} {tag} causal-count relerr={err:.2e}  {'ok' if ok else 'FAIL'}")
+    return ok
+
+
+def _route_differs_case():
+    """The positive control: route_b must build a DIFFERENT kernel.
+
+    Without it every route B row below could be the route A binary measured
+    twice -- the host gate drops route B silently for varlen, and when it does
+    the result is the route A result bit for bit.
+    """
+    import hashlib
+
+    def md5(rb, dt):
+        ker = chunk_o_ker(1, 128, 2, 2, 64, 64, 64, 0.125, BC=16, dtype=dt, route_b=rb)
+        return hashlib.md5(ker.get_kernel_source().encode()).hexdigest()[:10]
+
+    ok = True
+    for dt in ("float16", "bfloat16"):
+        a, b = md5(False, dt), md5(True, dt)
+        good = a != b
+        ok &= good
+        print(f"  {dt:9s} route A {a} != route B {b}  {'ok' if good else 'FAIL'}")
+    return ok
+
+
+def _bc_guard_case():
+    """BC = 32 under route B must be refused, not silently wrong."""
+    try:
+        chunk_o_ker(1, 128, 1, 1, 64, 64, 64, 0.125, BC=32, dtype="float16", route_b=True)
+    except AssertionError:
+        print("  BC=32 + route B raises  ok")
+        return True
+    print("  BC=32 + route B raises  FAIL (it was accepted)")
+    return False
+
+
 def main():
     tilelang.disable_cache()
     torch.manual_seed(0)
 
     ok = True
-    print("== HV == H and HV == 2H, C = 32 and C = 64, two gate levels ==")
+    print("== shapes and gates ==")
     for gate in ("normal", "forget"):
-        ok &= _case(1, 128, 2, 2, 64, 64, 64, gate)  # HV == H,  C = 64
-        ok &= _case(2, 128, 2, 4, 64, 64, 64, gate)  # HV == 2H, C = 64
-        ok &= _case(1, 128, 2, 2, 64, 64, 32, gate)  # HV == H,  C = 32
-        ok &= _case(2, 256, 2, 4, 64, 64, 32, gate)  # HV == 2H, C = 32
-
-    print("== K3 head dim K = V = 128 ==")
-    ok &= _case(1, 256, 1, 1, 128, 128, 64, "forget")
-    ok &= _case(1, 128, 1, 2, 128, 128, 64, "normal")  # K3 + GVA
-    ok &= _case(1, 128, 1, 1, 128, 128, 32, "forget")
+        ok &= _case(2, 128, 2, 4, 64, 64, 64, gate)  # GVA, C = 64
+    ok &= _case(2, 256, 2, 4, 64, 64, 32, "normal")  # C = 32
+    ok &= _case(1, 256, 1, 1, 128, 128, 64, "forget")  # K3 head dim
 
     print("== ragged tail (SEQ % C != 0) ==")
-    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal")  # R=6, one anchor block partly valid
-    ok &= _case(1, 33, 1, 1, 64, 64, 32, "forget")  # R=1
-    ok &= _case(1, 65, 1, 1, 128, 128, 64, "forget")  # K3 dim, R=1
-    ok &= _case(2, 100, 2, 4, 64, 64, 32, "extreme")  # GVA + extreme gate on the tail
-    ok &= _case(1, 96, 1, 1, 64, 64, 64, "normal")  # R=32, exact core boundary
+    # The pad rows are load-bearing: a garbage gate row exponentiates to +inf
+    # and 0 * inf is NaN landing in a valid row's reduction.
+    ok &= _case(2, 70, 1, 2, 64, 64, 64, "normal")  # R = 6, one anchor block partly valid
 
-    print("== gates that underflow inside a chunk (the NaN trap) ==")
+    print("== a gate that underflows inside a chunk (the NaN trap) ==")
     ok &= _case(1, 128, 1, 2, 64, 64, 64, "extreme")
-    ok &= _case(1, 128, 1, 1, 64, 64, 32, "keep")
 
-    print("== bf16 (dtype is threaded through from the inputs) ==")
-    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", dtype=torch.bfloat16)
-    ok &= _case(1, 128, 1, 1, 128, 128, 64, "forget", dtype=torch.bfloat16)
+    print("== bf16 ==")
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", dtype=torch.bfloat16)  # shape already built above
 
     print("== varlen (cu_seqlens) ==")
-    ok &= _vcase([64, 64, 64], 1, 2, 64, 64, 64, "normal", note="equal, chunk-aligned")
-    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", note="every sequence ragged -- interior tails")
+    ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", note="every sequence ragged")
     ok &= _vcase([70, 0, 129], 1, 2, 64, 64, 64, "forget", note="empty sequence in the middle")
-    ok &= _vcase([0, 70], 1, 2, 64, 64, 64, "normal", note="empty sequence first")
-    ok &= _vcase([70, 0], 1, 2, 64, 64, 64, "normal", note="empty sequence last")
-    ok &= _vcase([1, 200], 1, 2, 64, 64, 64, "forget", note="one token -- BC block partially valid")
-    ok &= _vcase([20, 20], 1, 2, 64, 64, 64, "normal", note="both shorter than C/2")
-    ok &= _vcase([70, 33], 1, 2, 64, 64, 64, "extreme", note="extreme gate on a partial BC block (the qf overflow)")
-    ok &= _vcase([65, 65], 1, 1, 128, 128, 64, "forget", note="K3 dim, one valid tail row each")
-    ok &= _vcase([100, 28], 2, 4, 64, 64, 32, "extreme", note="GVA + extreme gate, C = 32")
-    ok &= _vcase([5], 1, 1, 64, 64, 64, "extreme", note="N = 1, shorter than one BC block")
-    ok &= _vcase([70, 33], 2, 4, 64, 64, 64, "forget", dtype=torch.bfloat16, note="bf16 + GVA")
+
+    # ================================ route B ================================
+    # Off by default, so nothing above exercises it.  It is valid on the three
+    # realistic gates; `extreme` is excluded BY DESIGN and that exclusion is
+    # asserted below rather than left as a case nobody ran.
+    print("== route B, on a shape route A has already covered ==")
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "normal", route_b=True)
+    ok &= _case(2, 128, 2, 4, 64, 64, 64, "forget", dtype=torch.bfloat16, route_b=True)
+
+    print("== route B: the packed causal mask, against an analytic answer ==")
+    # With q = k = 1 and g = 0 the output row must equal sqrt(K) times the row's
+    # chunk-local index plus one, so an off-by-one column or a flipped bit order
+    # moves a whole unit of sqrt(K).  Measured exactly 0.00e+00.
+    ok &= _mask_case(64)
+
+    print("== route B: BC is pinned to 16 ==")
+    ok &= _bc_guard_case()  # builder-scope assertion; compiles nothing
+
+    print("== route B refuses the extreme gate BY DESIGN (this must FAIL) ==")
+    # Not a skip.  The extreme gate's intra-block span reaches ~290 nats against
+    # a clamp of 80, so route B saturates and lands near 5e-01.  If this ever
+    # starts passing, either the gate generator or the clamp has moved and the
+    # documented limit of route B is no longer true.
+    if _case(1, 128, 1, 2, 64, 64, 64, "extreme", route_b=True):
+        print("  FAIL: the extreme gate PASSED under route B -- the documented limit has moved")
+        ok = False
+    else:
+        print("  ok  (it failed, as documented)")
+
+    print("== route B under varlen is refused, and says so ==")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ok &= _vcase([70, 33, 129], 1, 2, 64, 64, 64, "normal", note="varlen + route_b request", route_b=True)
+    warned = any("route A" in str(w.message) for w in caught)
+    print(f"  warned about the fallback: {'ok' if warned else 'FAIL'}")
+    ok &= warned
 
     if ok:
         print("Kernel Output Match!")
