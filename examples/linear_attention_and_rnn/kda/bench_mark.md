@@ -11,40 +11,50 @@ Input parameter definitions:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | B | 1 | Batch size |
-| SEQ | 4096 | Sequence length |
-| H | 4 / 96 | Query heads (`HV = H`, no GVA) |
+| SEQ | 4096 / 8192 / 16384 | Sequence length |
+| H | 4 / 8 / 16 / 32 / 96 | Query heads (`HV = H`, no GVA) |
 | K, V | 128 | Key and value head dimension |
 | C | 64 | Chunk size |
 | BC | 16 | Anchor block inside a chunk |
 | dtype | float16 / bfloat16 | Gate `g` is fp32 |
 
-`H = 96` is the head count Kimi K3 runs, and it is the row that matters.
+float16 throughout. `route_b` and `KDA_WY_FIXEDCORE` are both opt-in, so the
+default column is what a caller who asks for nothing gets:
 
-Best performance results, float16:
+| H | SEQ | AscendC `safeGate=1` | tileLang default | ratio | tileLang `route_b` + `KDA_WY_FIXEDCORE` | ratio |
+|------|------|------|------|------|------|------|
+| 4 | 4096 | 788.14u ±7.8 | 1422.57u ±3.1 | 55.4% | 854.68u ±4.9 | **92.2%** |
+| 8 | 4096 | 1197.12u ±12.3 | 2457.73u ±9.7 | 48.7% | 1239.85u ±7.4 | **96.6%** |
+| 16 | 4096 | 2010.82u ±14.1 | 4799.50u ±13.8 | 41.9% | 2374.75u ±34.3 | **84.7%** |
+| 32 | 4096 | 3959.94u ±30.5 | 9559.25u ±7.0 | 41.4% | 4820.22u ±17.5 | **82.2%** |
+| 96 | 4096 | 11423.01u ±13.4 | 28239.44u ±39.8 | 40.5% | 14270.49u ±68.4 | **80.0%** |
+| 4 | 8192 | 1493.69u ±18.6 | 2807.97u ±24.7 | 53.2% | 1657.49u ±7.9 | **90.1%** |
+| 4 | 16384 | 2995.36u ±39.7 | 5698.17u ±6.1 | 52.6% | 3369.31u ±50.6 | **88.9%** |
 
-| H | AscendC | tileLang | Performance Ratio (AscendC/tileLang) |
-|------|------|------|------|
-| 4 | 781.16u ±5.6 | 867.62u ±10.8 | 90.0% |
-| 96 | 11443.26u ±3.3 | 14251.82u ±40.0 | **80.3%** |
+`H = 96` is the head count Kimi K3 runs. There the median is 80.0%, and the
+three collections span 79.80% to 80.57% -- it sits *on* the line rather than
+above it, and a batch taken on another day could land either side. The two
+trends either side of it are the more useful reading: the ratio falls with head
+count (96.6% at `H = 8` down to 80.0% at `H = 96`) and holds with sequence
+length (92.2% at 4096, 88.9% at 16384). What degrades this operator is
+parallelism, not work.
 
-The 80.3% is not a point estimate that happens to clear a line: the whole
-collection spread clears it, 80.21% at the slowest collection and 80.67% at the
-fastest, against a denominator whose own spread is 6.7u.
+`route_b` is worth more at `H = 96` than at `H = 4` -- 1.96x against 1.63x --
+which is the opposite of what a fixed-cost argument would predict. The reason is
+share: the two stages it changes are 75% of the pipeline at `H = 96` and 65% at
+`H = 4`. Any ratio quoted for this operator has to name its head count.
 
-Both configurations, and bfloat16, at the same shapes. `route_b` and
-`KDA_WY_FIXEDCORE` are both opt-in; the default column is what a caller who asks
-for nothing gets:
+bfloat16, at the two shapes it was taken on. There is no bf16 reference
+collection, so no ratio is given:
 
-| H | dtype | default | `route_b` | `route_b` + `KDA_WY_FIXEDCORE` |
-|------|------|------|------|------|
-| 4 | fp16 | 1429.69u ±5.8 (54.6%) | 867.62u ±10.8 (90.0%) | not collected |
-| 96 | fp16 | 28244.60u ±48.6 (40.5%) | 14459.51u ±31.7 (79.1%) | 14251.82u ±40.0 (80.3%) |
-| 4 | bf16 | 1445.55u ±9.5 | 897.42u ±8.0 | not collected |
-| 96 | bf16 | 28380.11u ±2.2 | 14671.21u ±23.2 | not collected |
+| H | default | `route_b` |
+|------|------|------|
+| 4 | 1445.55u ±9.5 | 897.42u ±8.0 |
+| 96 | 28380.11u ±2.2 | 14671.21u ±23.2 |
 
 bf16 reaches `route_b` through a float32 round trip in stage 6, because the part
 has no bfloat16 vector select. It costs 1.5% end to end at `H = 96` and 3.4% at
-`H = 4`. There is no bf16 reference collection, so no ratio is given.
+`H = 4`.
 
 Per stage at `H = 96`, fp16:
 
@@ -62,8 +72,8 @@ vector pipe's 46.5%, which is the next thing worth optimising there.
 
 **Measurement method.** `msprof` in its full form (`msprof op` returns Task
 Duration 0.000000 on this box), device Task Duration read from `op_summary`.
-Every figure is the median of **three independent collections**, each of 12
-iterations at `H = 4` and 6 at `H = 96`, with the first iteration dropped — it
+Every figure is the median of **three independent collections**, each of 6 to 12
+iterations depending on the shape, with the first iteration dropped — it
 carries first-touch cost and is always the outlier. The half-range across
 collections is quoted so the reader can see what the number is worth; collections
 of an identical configuration vary by up to 25u per stage, which is why nothing
@@ -83,18 +93,20 @@ marker is the absolute time after that step, measured on board at `H = 4`, and
 its ratio against the reference:
 
 0. **Correct, unoptimized** — the six-stage pipeline straight from the paper's
-   factorisation  **--- 5992.20u, 13.0%**
+   factorisation  **--- 5992.20u, 13.2%**
 1. **Instruction Vectorization**: materialise the broadcasts that otherwise lower
-   to one narrow instruction per row  **--- 2417.41u, 32.3%**
+   to one narrow instruction per row  **--- 2417.41u, 32.6%**
 2. **Algorithm to Cube (kkt)**: an anchored `BC` decomposition puts the
    off-diagonal strips of the gated Gram matrix into a plain matmul
-   **--- 1688u, 46.3%**
+   **--- 1688u, 46.7%**
 3. **Algorithm to Cube (solve_tril)**: a doubling Neumann series replaces 62 rows
-   of serial forward substitution with 8 matmuls  **--- 1584.83u, 49.3%**
+   of serial forward substitution with 8 matmuls  **--- 1584.83u, 49.7%**
 4. **Redundant Computation Elimination**: five cuts, each one a piece of work
-   another stage had already done  **--- 1438.16u, 54.3%**
+   another stage had already done  **--- 1438.16u, 54.8%**
 5. **`route_b`**: the diagonal blocks join the strips on the cube
-   **--- 867.62u, 90.0%**
+   **--- 874.74u, 90.1%**
+6. **`KDA_WY_FIXEDCORE`**: stage 4 on the physical core count rather than the
+   task count  **--- 854.68u, 92.2%**
 
 Notes on the two that carry most of the gain:
 
@@ -124,9 +136,10 @@ each is recorded here so it is not tried again:
   `T.copy(ub, l1)` never emits a UB→L1 move: the generated AscendC contains zero
   `copy_ub_to_l1`, and the compiler silently routes it through GM instead. There
   is no UB→L1 path to fuse across.
-- **There is no inter-stage gap to recover anyway.** Wall clock for the whole
-  prefill is 14151.58u against a sum of the six kernel times of 14459.51u, so the
-  launches already overlap; fusion would be removing a cost that is not being
+- **There is no inter-stage gap to recover anyway.** Measured as a matched pair
+  in one `route_b` run at `H = 96`: wall clock for the whole prefill is 14151.58u
+  against a sum of the six kernel times of 14459.51u, so the launches already
+  overlap; fusion would be removing a cost that is not being
   paid. The official PyPTO implementation reaches the same conclusion by
   construction — it also lands `gk`, `aqk`, `akk`, `w`, `u`, `qg`, `kg`, `v_new`
   and `h` in GM.
@@ -155,8 +168,8 @@ rewritten until they were.
 | Configuration | L1 Residency | Instruction Vectorization | Multi-Buffer | Sync Elimination | CV pipelined | Optimized Sync Frequency | Reduced Instructions | Algorithm to Cube | Redundancy Removal | Performance (`H = 96`) |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | default | × | √ | × | × | × | × | × | strips | √ | 40.5% |
-| `route_b` | × | √ | × | × | × | × | × | strips + diagonal | √ | 79.1% |
-| `route_b` + `KDA_WY_FIXEDCORE` | × | √ | × | × | × | × | × | strips + diagonal | √ | **80.3%** |
+| `route_b` | × | √ | × | × | × | × | × | strips + diagonal | √ | 79.3% |
+| `route_b` + `KDA_WY_FIXEDCORE` | × | √ | × | × | × | × | × | strips + diagonal | √ | **80.0%** |
 
 Two of the crosses are measured dead ends rather than unstarted work, and are
 explained above: **Multi-Buffer** (cube-side, no gain at 4.2% MAC occupancy) and

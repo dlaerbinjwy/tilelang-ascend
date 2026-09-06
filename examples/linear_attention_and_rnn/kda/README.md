@@ -297,10 +297,16 @@ Shapes exercised by the tests: `B = 1, 2`; `H = 1, 2`; `HV = 1 … 6`;
 Verified on `Ascend910_9362` (A3, 20 Cube / 40 Vector cores).  Nothing here has
 been run on an A2-class 910B1/B2.  Measured results are in `bench_mark.md`.
 
-**Full pipeline vs the L0 token-by-token recurrence** (`test_vs_both_goldens`,
-18 configurations covering both gate extremes, GVA, `K != V`, the K3 spec,
-`B = 4`, the single-chunk case `SEQ == C` and a non-zero `initial_state`): all
-pass, with a relative error below **`1e-3` in fp16** and **`7e-3` in bf16**. The
+**Full pipeline vs the L0 token-by-token recurrence** (`test_vs_both_goldens`):
+relative error below **`1e-3` in fp16** and **`7e-3` in bf16**.
+
+What ships here is three configurations -- a GVA workhorse, a ragged tail, and
+the bfloat16 pass -- because a distinct shape costs about 6.2s of JIT compile on
+board and a repeat costs 0.2s, so the wall time of an example is its
+distinct-shape count and little else. The wider sweep that the paragraph above
+rests on -- both gate extremes, `K != V`, the K3 spec at `H = 96`, `B = 4`, the
+single-chunk case `SEQ == C`, a non-zero `initial_state` -- is the local
+regression rather than the shipped file, and its results are in `bench_mark.md`. The
 two goldens — the L0 recurrence and the chunkwise reference — sit
 `3e-7 … 4e-6` apart, and the kernel output is *equidistant* from both. Since the
 kernel shares its decomposition with the chunkwise reference and not with the
@@ -332,14 +338,21 @@ memory.
 **Per-stage self-tests**, each fed the golden inputs from
 `kda_chunk_ref.stage_tensors()` and compared against the matching entry:
 
+`Cases` is what the shipped `__main__` validates. Each file covers three
+distinct shapes -- a GVA workhorse at `C = 64`, a ragged tail, and a varlen batch
+with an empty sequence in the middle -- and takes its second gate and its
+bfloat16 pass on a shape already compiled, which is why the counts exceed three
+while the wall time does not. Stage 6 is larger because it ships two routes and
+`route_b` builds a different kernel.
+
 | Stage | Golden | Threshold | Cases |
 |---|---|---|:-:|
-| 1 `chunk_cumsum` | `["G"]` | `rel < 1e-5`, all finite | 12 |
-| 2 `chunk_scaled_dot_kkt` | `["L"]` | fp16 `5e-3` / bf16 `3e-2` | 16 |
-| 3 `solve_tril` | `ref_solve_tril()` and `["A"]` | adaptive (below) | 16 |
-| 4 `wy_fast` | `["W"]`, `["U"]` | fp16 `5e-3` / bf16 `3e-2` | 8 |
-| 5 `chunk_h` | `["states"]`, `["Vt"]`, `["SF"]` | fp16 `2e-2` / bf16 `6e-2` | 10 |
-| 6 `chunk_o` | `["o"]` | fp16 `3e-2` / bf16 `6e-2` | 15 |
+| 1 `chunk_cumsum` | `["G"]` | `rel < 1e-5`, all finite | 4 |
+| 2 `chunk_scaled_dot_kkt` | `["L"]` | fp16 `5e-3` / bf16 `3e-2` | 5 |
+| 3 `solve_tril` | `ref_solve_tril()` and `["A"]` | adaptive (below) | 6 |
+| 4 `wy_fast` | `["W"]`, `["U"]` | fp16 `5e-3` / bf16 `3e-2` | 4 |
+| 5 `chunk_h` | `["states"]`, `["Vt"]`, `["SF"]` | fp16 `2e-2` / bf16 `6e-2` | 5 |
+| 6 `chunk_o` | `["o"]` | fp16 `3e-2` / bf16 `6e-2` | 11 |
 
 bf16 tolerances are roughly 8× the fp16 ones because bf16 keeps 8 mantissa bits
 against fp16's 11 and both gemm operands are rounded once.
