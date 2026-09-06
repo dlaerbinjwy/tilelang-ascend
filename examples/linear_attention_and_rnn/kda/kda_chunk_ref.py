@@ -771,24 +771,32 @@ def _mk(B, SEQ, H, HV, K, V, gate):
 
 
 def main():
+    """Run the six checks, and on failure name the ones that failed LAST.
+
+    The example runner reports only `tail -n 1` of a failing script
+    (`examples/bench_test.sh`), and every failure here used to end on whatever
+    the last test happened to print -- the same line whichever check had
+    actually failed, which makes a CI log say nothing about the cause.  Printing
+    the roll-up last means the one line CI shows is the diagnosis.
+    """
     torch.manual_seed(0)
-    ok = True
-    ok &= test_chunk_vs_recurrent()
-    print()
-    ok &= test_state_relay()
-    print()
-    ok &= test_empty_sequence()
-    print()
-    ok &= test_varlen()
-    print()
-    ok &= test_varlen_equals_fixed_batch()
-    print()
-    ok &= test_naive_fold_blows_up()
-    print()
-    if ok:
+    results = []
+    for name, fn in (
+        ("chunk_vs_recurrent", test_chunk_vs_recurrent),
+        ("state_relay", test_state_relay),
+        ("empty_sequence", test_empty_sequence),
+        ("varlen", test_varlen),
+        ("varlen_equals_fixed_batch", test_varlen_equals_fixed_batch),
+        ("naive_fold_blows_up", test_naive_fold_blows_up),
+    ):
+        results.append((name, bool(fn())))
+        print()
+
+    failed = [name for name, good in results if not good]
+    if not failed:
         print("Kernel Output Match!")
     else:
-        raise SystemExit(1)
+        raise SystemExit("FAILED %d/%d: %s" % (len(failed), len(results), ", ".join(failed)))
 
 
 if __name__ == "__main__":

@@ -544,26 +544,26 @@ def main():
     # Goldens run on CPU on purpose: an NPU einsum dispatches to matmul with
     # reduced-precision accumulation and drifts two exact fp32 references by
     # ~3e-4, which is the same order as the quantity being measured.
-    ok = True
-    ok &= test_vs_both_goldens()
-    print()
-    ok &= test_state_relay()
-    print()
-    ok &= test_zero_state_equals_none()
-    print()
-    ok &= test_empty_sequence()
-    print()
-    ok &= test_varlen_vs_both_goldens()
-    print()
-    ok &= test_varlen_equals_per_sequence_calls()
-    print()
-    print()
-    print()
+    # The roll-up is printed last so that the one line the example runner shows
+    # for a failing script (`tail -n 1`, examples/bench_test.sh) names the check
+    # that failed, rather than whatever the last one happened to print.
+    results = []
+    for name, fn in (
+        ("vs_both_goldens", test_vs_both_goldens),
+        ("state_relay", test_state_relay),
+        ("zero_state_equals_none", test_zero_state_equals_none),
+        ("empty_sequence", test_empty_sequence),
+        ("varlen_vs_both_goldens", test_varlen_vs_both_goldens),
+        ("varlen_equals_per_sequence_calls", test_varlen_equals_per_sequence_calls),
+    ):
+        results.append((name, bool(fn())))
+        print()
 
-    if ok:
+    failed = [name for name, good in results if not good]
+    if not failed:
         print("Kernel Output Match!")
     else:
-        raise SystemExit(1)
+        raise SystemExit("FAILED %d/%d: %s" % (len(failed), len(results), ", ".join(failed)))
 
 
 if __name__ == "__main__":
