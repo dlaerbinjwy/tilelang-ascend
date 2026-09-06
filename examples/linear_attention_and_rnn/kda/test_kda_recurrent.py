@@ -77,10 +77,17 @@ def on_cpu(fn, q, k, v, g, beta, s0):
 
 
 def test_goldens_agree():
+    """Cross-check our recurrence against FLA's, when FLA is available.
+
+    Returns (ok, ran).  `ran` is False when FLA is not installed, and the caller
+    says so on the success line -- a green log that does not distinguish "the
+    cross-check passed" from "the cross-check was skipped" is not evidence of
+    the first, and this file's whole purpose is that cross-check.
+    """
     print("[0] the two goldens against each other (fp32 inputs, strict 1e-5)")
     if golden_a is None:
         print("    FLA not found, skipping.  Install with: pip install flash-linear-attention")
-        return True
+        return True, False
     ok = True
     for B, SEQ, H, HV, K, V in CASES:
         worst = 0.0
@@ -93,7 +100,7 @@ def test_goldens_agree():
         good = worst < 1e-5
         ok &= good
         print(f"    B{B} T{SEQ:<4d} H{H} HV{HV} K{K:<3d} V{V:<3d}  max|A-B| = {worst:.2e}  {'ok' if good else 'FAIL'}")
-    return ok
+    return ok, True
 
 
 def test_kernel_vs_goldens():
@@ -169,14 +176,17 @@ def main():
     tilelang.disable_cache()
     torch.manual_seed(0)
 
-    ok = test_goldens_agree()
+    ok, fla_ran = test_goldens_agree()
     ok &= test_kernel_vs_goldens()
     ok &= test_segmented()
     ok &= test_zero_state()
 
     print()
     if ok:
-        print("Kernel Output Match!")
+        # The success line carries what actually ran.  The example runner keeps
+        # only the output of a FAILING script, so a passing log is the one place
+        # this can be recorded at all.
+        print("Kernel Output Match!  (FLA cross-check: %s)" % ("ran" if fla_ran else "SKIPPED, FLA not installed"))
     else:
         raise SystemExit(1)
 

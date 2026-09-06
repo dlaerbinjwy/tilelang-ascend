@@ -399,6 +399,32 @@ benchmark harness, which has to flip a caller it does not control.
   comes from an `msprof` collection on board, against the hand-written AscendC
   operator built from `gitcode.com/cann/ops-transformer`. No number in this
   directory is an estimate.
+* **Two things about the CPU goldens that cost a CI cycle each, so they are
+  written down here.**
+
+  `kda_ref.py` and `kda_chunk_ref.py` set `torch.backends.mkldnn.enabled = False`
+  at import. They are the goldens, and a golden that quietly computes at reduced
+  precision cannot judge a kernel. On an x86 runner oneDNN may take fp32 matmul
+  through bfloat16, selected by `ONEDNN_DEFAULT_FPMATH_MODE` in the environment
+  rather than by anything here, and it hits only the batched forms a chunkwise
+  reference is made of: 2-D `a @ b` is untouched at 5.4e-07 while 3-D `bmm` goes
+  to 2.1e-03, 5-D `matmul` to 2.8e-03 and `einsum` to 1.2e-03 -- which lands as
+  4.4e-03 to 7.3e-03 against a 1e-5 acceptance threshold. Note that
+  `torch.set_float32_matmul_precision("highest")` does *not* defeat it: that is
+  already the default and governs a different path.
+
+  `test_varlen_equals_fixed_batch` in `kda_chunk_ref.py` is bounded relatively
+  rather than by `torch.equal`. It compares N calls at `B = 1` against one call
+  at `B = N`, and the folded batch extent is what BLAS blocks its 5-D matmuls
+  over, so the reduction order is a property of the machine rather than of the
+  algebra. Measured at 40 threads against an output scale near 0.8: exactly 0 on
+  the three shapes it ships, 7.3e-11 on `[128, 128]` at `C = 64` and 1.8e-9 on
+  `[512, 512]`. The analogous check in `kda_ref.py` stays exact on purpose --
+  that reference is a token-by-token recurrence whose reduction axis is `K`, not
+  the batch.
+
+  Both files also print the roll-up of which checks failed as their last line,
+  because `examples/bench_test.sh` reports only `tail -n 1` of a failing script.
 * **A ragged tail chunk and varlen are both supported.** `SEQ % C != 0` is
   handled by zero-filling the pad rows inside the kernel -- a garbage gate row
   exponentiates to `+inf`, and `0 * inf` is `NaN` landing in a *valid* row's
