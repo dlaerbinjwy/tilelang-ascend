@@ -432,7 +432,9 @@ benchmark harness, which has to flip a caller it does not control.
   through `kda_varlen.py`, and a batched varlen run is asserted bit-identical to
   running each sequence on its own.
 * **`route_b` is off by default.** It puts the diagonal blocks of stages 2 and 6
-  on the cube and is worth 2.3x on stage 2 and 2.4x on stage 6, but it saturates a gate that spans more than
+  on the cube and is worth 3.05x on stage 2 and 2.74x on stage 6 at `H = 96`
+  (2.24x and 2.4x at `H = 4` -- this operator's ratios always have to name a head
+  count), but it saturates a gate that spans more than
   its clamp inside one block, so it is opt-in rather than automatic. The
   approximation itself is not unusual -- the reference makes the same one, and
   harder: it clamps the same exponent two-sided at 55.45 nats
@@ -448,15 +450,20 @@ benchmark harness, which has to flip a caller it does not control.
   all GM tensors -- so fusion is not where the remaining gap is. It does size
   its Cube-to-Vector scratch by physical core count rather than by logical task
   count, and that was tried here: the grid becomes the core count and each core
-  walks its own slice of the tasks, which brings the six stages' workspaces from
-  1.57 GB to 5.1 MB at `H = 96`. Stage 4 ships it behind `KDA_WY_FIXEDCORE` and it
-  is worth 192.3u there, 11.3% of that stage.
+  walks its own slice of the tasks. Stage 4 ships it behind `KDA_WY_FIXEDCORE`,
+  where it is worth 192.3u -- 11.3% of that stage -- and takes that stage's own
+  scratch from `[6144, 64, 128] x 2` fp16 (192.00 MiB) to `[20, 64, 128] x 2`
+  (640 KiB), the factor 6144/20 = 307.2. Enumerating every stage's
+  `workspace_idx` at this shape gives 1.796 GiB across the six, and 7.5 MiB if
+  all six were converted.
 
   The reason it pays is not the workspace size. Stage 4's grid is
   `B * HV * chunk_num`, 6144 blocks at `H = 96`, and each block runs about 277 ns
   against a per-block prologue -- nine `GlobalTensor` and five `TBuf`
-  constructions -- of about 164 ns, all of it on the scalar unit. The generated
-  kernel is 131 lines and contains no `GetValue`: the work is not scalar, the
+  constructions -- of about 164 ns, all of it on the scalar unit. Both figures are
+  core-time per logical task (stage duration / `Block Num`), not the wall time of
+  one block. The generated kernel contains no `GetValue` at any shape tried: the
+  work is not scalar, the
   *setup* is, and Fixed Core pays it once per core instead of once per task.
   Across the six stages that setup is 4561u of 14459u at `H = 96`, so the same
   change applies to the other five and has not been made.

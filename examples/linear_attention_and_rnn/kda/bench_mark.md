@@ -102,7 +102,8 @@ its ratio against the reference:
 3. **Algorithm to Cube (solve_tril)**: a doubling Neumann series replaces 62 rows
    of serial forward substitution with 8 matmuls  **--- 1584.83u, 49.7%**
 4. **Redundant Computation Elimination**: five cuts, each one a piece of work
-   another stage had already done  **--- 1438.16u, 54.8%**
+   that turned out to be unnecessary -- mostly a duplicate of something the same
+   kernel already did a line above  **--- 1438.16u, 54.8%**
 5. **`route_b`**: the diagonal blocks join the strips on the cube
    **--- 874.74u, 90.1%**
 6. **`KDA_WY_FIXEDCORE`**: stage 4 on the physical core count rather than the
@@ -132,13 +133,22 @@ that asks for it falls back to route A and warns.
 **Why there is no operator fusion.** Three things were tried and measured, and
 each is recorded here so it is not tried again:
 
-- **Fusing stages to keep tensors off GM does not work in this dialect.**
-  `T.copy(ub, l1)` never emits a UB→L1 move: the generated AscendC contains zero
-  `copy_ub_to_l1`, and the compiler silently routes it through GM instead. There
-  is no UB→L1 path to fuse across.
-- **There is no inter-stage gap to recover anyway.** Measured as a matched pair
-  in one `route_b` run at `H = 96`: wall clock for the whole prefill is 14151.58u
-  against a sum of the six kernel times of 14459.51u, so the launches already
+- **On this platform a Cube-Vector handoff costs a GM round trip whether or not
+  the two halves share a kernel.** `T.copy(ub, l1)` emits no UB→L1 move here: the
+  generated AscendC contains zero `copy_ub_to_l1`, and so does every one of the
+  72 kernels in this box's cache (against 267 `copy_gm_to_l1`). It is not
+  silent -- `AscendWorkspaceReduction` (`tilelang/engine/phase.py:83`) rewrites
+  the copy into a two-stage GM one, and the tutorial documents it as always on.
+  The gate is one line, `needs_gm_workspace_ = (platform != "A5")`
+  (`src/transform/ascend_workspace_reduction.cc:137`): **A5 keeps the direct
+  path, A3 -- this board -- does not**, and the `pto_use_pipe` flag cannot change
+  that because the workspace test is an `||`. So the cost sits on the AIC/AIV
+  boundary rather than the kernel boundary, and fusing two stages into one kernel
+  does not remove it. On A5 this bullet would have to be re-measured.
+- **There is no inter-stage gap to recover anyway.** The six launches are
+  serialised on one stream, and the five gaps between them measure 2.5-10us each,
+  about 21us against a 14459.51u prefill -- **0.15%**. Fusion would be reclaiming
+  idle that is not there. The vendor operator already
   overlap; fusion would be removing a cost that is not being
   paid. The official PyPTO implementation reaches the same conclusion by
   construction — it also lands `gk`, `aqk`, `akk`, `w`, `u`, `qg`, `kg`, `v_new`
@@ -171,11 +181,13 @@ rewritten until they were.
 | `route_b` | × | √ | × | × | × | × | × | strips + diagonal | √ | 79.3% |
 | `route_b` + `KDA_WY_FIXEDCORE` | × | √ | × | × | × | × | × | strips + diagonal | √ | **80.0%** |
 
-Two of the crosses are measured dead ends rather than unstarted work, and are
-explained above: **Multi-Buffer** (cube-side, no gain at 4.2% MAC occupancy) and
-**L1 Residency** (what this operator does is per-task residency, not the
-across-basic-block residency that column means). **Sync Elimination** is the
-largest single item left.
+One of the crosses is a measured dead end rather than unstarted work:
+**Multi-Buffer** on the cube side, which has three A/B collections behind it and
+came out slightly slower, at an unchanged 4.2% MAC occupancy. **L1 Residency** is
+a cross because what this operator does is per-task residency rather than the
+across-basic-block residency that column means -- but no attempt at the latter
+has been priced, so it is unstarted work, not a dead end. **Sync Elimination** is
+the largest single item left.
 
 Operator implementation: https://github.com/tile-ai/tilelang-ascend/tree/ascendc_pto/examples/linear_attention_and_rnn/kda
 
