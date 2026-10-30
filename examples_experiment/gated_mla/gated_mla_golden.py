@@ -181,8 +181,7 @@ def make_decode_inputs(seed=0):
 
 
 def stage_reference(inputs, meta):
-    q, qa, c, ka, wk, wv = (
-        inputs[k].double() for k in ("q_content", "q_aux", "latent_kv", "key_aux", "w_k", "w_v"))
+    q, qa, c, ka, wk, wv = (inputs[k].double() for k in ("q_content", "q_aux", "latent_kv", "key_aux", "w_k", "w_v"))
     visible = min(meta["kv_lens"][0], meta["query_start"][0] + 1)
     scale = meta.get("scale", 1 / math.sqrt(192))
     ql = q[0, 0, 0] @ wk[0]
@@ -249,7 +248,8 @@ def check_case(inputs, meta, *, case_name="decode", output_dir=None, repeat=1):
         repeat=repeat,
         comparisons=metrics,
         stages=stages,
-        independent_references=True)
+        independent_references=True,
+    )
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -283,9 +283,9 @@ def expanded_reference(
 ) -> torch.Tensor:
     """Expand K/V, explicitly slice the causal prefix, then reduce values.
 
-This route loops over query positions, so it does not share the absorbed route's
-vectorized mask or softmax implementation.
-"""
+    This route loops over query positions, so it does not share the absorbed route's
+    vectorized mask or softmax implementation.
+    """
     spec = validate_inputs(
         q_content,
         q_aux,
@@ -302,8 +302,8 @@ vectorized mask or softmax implementation.
     if compute_dtype not in (torch.float32, torch.float64):
         raise ValueError("reference compute_dtype must be torch.float32 or torch.float64")
     q, qa, c, ka, wk, wv, gate = (
-        tensor.to(dtype=compute_dtype)
-        for tensor in (q_content, q_aux, latent_kv, key_aux, w_k, w_v, gate_logits))
+        tensor.to(dtype=compute_dtype) for tensor in (q_content, q_aux, latent_kv, key_aux, w_k, w_v, gate_logits)
+    )
     out = torch.zeros(
         (spec.B, spec.Tq, spec.H, spec.V),
         dtype=compute_dtype,
@@ -313,8 +313,8 @@ vectorized mask or softmax implementation.
         if spec.q_lens[b] == 0:
             continue
         for h in range(spec.H):
-            keys = c[b, :spec.kv_lens[b]] @ wk[h].transpose(-1, -2)
-            values = c[b, :spec.kv_lens[b]] @ wv[h].transpose(-1, -2)
+            keys = c[b, : spec.kv_lens[b]] @ wk[h].transpose(-1, -2)
+            values = c[b, : spec.kv_lens[b]] @ wv[h].transpose(-1, -2)
             for i in range(spec.q_lens[b]):
                 visible = spec.query_start[b] + i + 1
                 score = (keys[:visible] @ q[b, i, h] + ka[b, :visible] @ qa[b, i, h]) * spec.scale
@@ -343,10 +343,10 @@ def absorbed_reference(
 ) -> torch.Tensor:
     """Absorb W_K into queries; softmax-read the latent cache; restore values.
 
-round_intermediates=True is a CPU numerical-budget model: Qlatent, softmax
-probabilities and Z are rounded to the input dtype after FP32/FP64 arithmetic.
-It is deliberately not claimed to emulate any specific Cube accumulation order.
-"""
+    round_intermediates=True is a CPU numerical-budget model: Qlatent, softmax
+    probabilities and Z are rounded to the input dtype after FP32/FP64 arithmetic.
+    It is deliberately not claimed to emulate any specific Cube accumulation order.
+    """
     spec = validate_inputs(
         q_content,
         q_aux,
@@ -363,8 +363,8 @@ It is deliberately not claimed to emulate any specific Cube accumulation order.
     if compute_dtype not in (torch.float32, torch.float64):
         raise ValueError("reference compute_dtype must be torch.float32 or torch.float64")
     q, qa, c, ka, wk, wv, gate = (
-        tensor.to(dtype=compute_dtype)
-        for tensor in (q_content, q_aux, latent_kv, key_aux, w_k, w_v, gate_logits))
+        tensor.to(dtype=compute_dtype) for tensor in (q_content, q_aux, latent_kv, key_aux, w_k, w_v, gate_logits)
+    )
     out = torch.zeros(
         (spec.B, spec.Tq, spec.H, spec.V),
         dtype=compute_dtype,
@@ -382,8 +382,7 @@ It is deliberately not claimed to emulate any specific Cube accumulation order.
             q_latent = q[b, :qn, h] @ wk[h]
             if round_intermediates:
                 q_latent = q_latent.to(q_content.dtype).to(compute_dtype)
-            scores = (q_latent @ c[b, :kn].transpose(-1, -2) +
-                      qa[b, :qn, h] @ ka[b, :kn].transpose(-1, -2)) * spec.scale
+            scores = (q_latent @ c[b, :kn].transpose(-1, -2) + qa[b, :qn, h] @ ka[b, :kn].transpose(-1, -2)) * spec.scale
             probability = torch.softmax(scores.masked_fill(~visible, -torch.inf), dim=-1)
             if round_intermediates:
                 probability = probability.to(q_content.dtype).to(compute_dtype)

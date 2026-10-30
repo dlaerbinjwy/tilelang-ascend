@@ -37,8 +37,7 @@ SCALE = 1 / math.sqrt(192)
 
 def validate_domain(inputs, metadata):
     spec = validate_inputs(**inputs, **metadata, require_npu=True, allowed_dtypes=(torch.float16,))
-    if (spec.B, spec.Tq, spec.Tk, spec.H, spec.D, spec.E, spec.R, spec.V) != (1, 1, 64, 1, 128, 64,
-                                                                              512, 128):
+    if (spec.B, spec.Tq, spec.Tk, spec.H, spec.D, spec.E, spec.R, spec.V) != (1, 1, 64, 1, 128, 64, 512, 128):
         raise ValueError("This benchmark supports only the frozen Tk=64 decode domain")
     return spec
 
@@ -54,8 +53,7 @@ def torch_fp32_core(inputs, metadata):
     scores = (cache @ ql + aux @ inputs["q_aux"][0, 0, 0].float()) * spec.scale
     latent = torch.softmax(scores, dim=0) @ cache
     value = inputs["w_v"][0].float() @ latent
-    return (value * torch.sigmoid(inputs["gate_logits"][0, 0, 0].float())).half().reshape(
-        1, 1, 1, 128)
+    return (value * torch.sigmoid(inputs["gate_logits"][0, 0, 0].float())).half().reshape(1, 1, 1, 128)
 
 
 def fia_core(inputs, metadata, block_table):
@@ -82,8 +80,7 @@ def fia_core(inputs, metadata, block_table):
         sparse_mode=0,
     )
     value = inputs["w_v"][0].float() @ latent.reshape(512).float()
-    return (value * torch.sigmoid(inputs["gate_logits"][0, 0, 0].float())).half().reshape(
-        1, 1, 1, 128)
+    return (value * torch.sigmoid(inputs["gate_logits"][0, 0, 0].float())).half().reshape(1, 1, 1, 128)
 
 
 def summaries(samples):
@@ -114,10 +111,7 @@ def eager_timing(function, warmup, repeats):
         end.synchronize()
         wall_times.append((time.perf_counter() - before) * 1e6)
         event_times.append(start.elapsed_time(end) * 1000)
-    return {
-        "event_interval": summaries(event_times),
-        "wall_with_end_event_sync": summaries(wall_times)
-    }, output
+    return {"event_interval": summaries(event_times), "wall_with_end_event_sync": summaries(wall_times)}, output
 
 
 def graph_timing(function, batch, repeats):
@@ -173,7 +167,7 @@ def command_metadata(command):
         "status": "ok" if result.returncode == 0 else "failed",
         "returncode": result.returncode,
         "stdout": result.stdout,
-        "stderr": result.stderr
+        "stderr": result.stderr,
     }
 
 
@@ -183,50 +177,40 @@ def git_revision(root):
 
 
 def environment(source):
-    native = sorted({
-        line.split()[-1]
-        for line in Path("/proc/self/maps").read_text().splitlines()
-        if ("libtilelang" in line or "libtvm" in line) and ".so" in line
-    })
+    native = sorted(
+        {
+            line.split()[-1]
+            for line in Path("/proc/self/maps").read_text().splitlines()
+            if ("libtilelang" in line or "libtvm" in line) and ".so" in line
+        }
+    )
     root = Path(tilelang.__file__).resolve().parents[1]
     return {
-        "date":
-            datetime.now(timezone(timedelta(hours=9))).isoformat(),
-        "python":
-            sys.version,
-        "python_executable":
-            sys.executable,
-        "torch":
-            torch.__version__,
-        "torch_npu":
-            torch_npu.__version__,
-        "tilelang":
-            tilelang.__version__,
-        "tilelang_file":
-            tilelang.__file__,
-        "tilelang_commit":
-            git_revision(root),
-        "native_libraries":
-            native,
-        "device":
-            torch.npu.get_device_name(0),
-        "device_properties":
-            str(torch.npu.get_device_properties(0)),
-        "npu_smi":
-            command_metadata(["npu-smi", "info"]),
-        "cann_version":
-            next((p.read_text() for p in (
-                Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
-                / "opp/version.info",
-                Path(
-                    os.environ.get("ASCEND_OPP_PATH",
-                                   "/usr/local/Ascend/ascend-toolkit/latest/opp")) / "version.info",
-            ) if p.is_file()), "unavailable"),
-        "source_sha256": {
-            p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.glob("*.py")
-        },
-        "benchmark_sha256":
-            hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "date": datetime.now(timezone(timedelta(hours=9))).isoformat(),
+        "python": sys.version,
+        "python_executable": sys.executable,
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "tilelang": tilelang.__version__,
+        "tilelang_file": tilelang.__file__,
+        "tilelang_commit": git_revision(root),
+        "native_libraries": native,
+        "device": torch.npu.get_device_name(0),
+        "device_properties": str(torch.npu.get_device_properties(0)),
+        "npu_smi": command_metadata(["npu-smi", "info"]),
+        "cann_version": next(
+            (
+                p.read_text()
+                for p in (
+                    Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")) / "opp/version.info",
+                    Path(os.environ.get("ASCEND_OPP_PATH", "/usr/local/Ascend/ascend-toolkit/latest/opp")) / "version.info",
+                )
+                if p.is_file()
+            ),
+            "unavailable",
+        ),
+        "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.glob("*.py")},
+        "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }
 
 
@@ -247,16 +231,10 @@ def profile_entry(stage, output, visible):
         torch.npu.synchronize()
         reference = stage_reference(cpu, metadata)
         if stage == "value_gate":
-            torch.testing.assert_close(
-                result[0].cpu().double(), reference["ungated"], rtol=1e-3, atol=5e-5)
+            torch.testing.assert_close(result[0].cpu().double(), reference["ungated"], rtol=1e-3, atol=5e-5)
             assert_fp16_close(result[1].cpu(), expanded_reference(**cpu, **metadata))
         else:
-            key = {
-                "q_absorb": "q_latent",
-                "scores": "scores",
-                "softmax": "probs",
-                "latent_readout": "latent_out"
-            }[stage]
+            key = {"q_absorb": "q_latent", "scores": "scores", "softmax": "probs", "latent_readout": "latent_out"}[stage]
             torch.testing.assert_close(result.cpu().double(), reference[key], rtol=1e-3, atol=5e-5)
     expected = list(STAGES) if stage == "chain" else [stage]
     (output / "profile_entry.json").write_text(
@@ -269,41 +247,23 @@ def profile_entry(stage, output, visible):
                 "runtime_kernel_name": "main_kernel",
                 "warmup_in_entry": 0,
             },
-            indent=2) + "\n")
-    print(
-        "GMLA_PROFILE_ENTRY_PASS " + json.dumps({
-            "stage": stage,
-            "expected_launches": len(expected)
-        }),
-        flush=True)
+            indent=2,
+        )
+        + "\n"
+    )
+    print("GMLA_PROFILE_ENTRY_PASS " + json.dumps({"stage": stage, "expected_launches": len(expected)}), flush=True)
 
 
 def benchmark(output, warmup, repeats, graph_batch):
     result = {
-        "shape": {
-            "B": 1,
-            "H": 1,
-            "Tq": 1,
-            "Tk": 64,
-            "D": 128,
-            "E": 64,
-            "R": 512,
-            "V": 128
-        },
-        "dtype":
-            "float16",
-        "scale":
-            SCALE,
-        "warmup_calls":
-            warmup,
-        "cache_policy":
-            "reused inputs and weights; no L2 flush",
-        "eager_event_scope":
-            "complete call interval including device idle gaps from host dispatch",
-        "graph_scope":
-            "batched captured operator calls; Python metadata checks and allocation dispatch occur during capture",
-        "fia_layout":
-            "identity block table prepared once; zero-copy cache views created inside each call",
+        "shape": {"B": 1, "H": 1, "Tq": 1, "Tk": 64, "D": 128, "E": 64, "R": 512, "V": 128},
+        "dtype": "float16",
+        "scale": SCALE,
+        "warmup_calls": warmup,
+        "cache_policy": "reused inputs and weights; no L2 flush",
+        "eager_event_scope": "complete call interval including device idle gaps from host dispatch",
+        "graph_scope": "batched captured operator calls; Python metadata checks and allocation dispatch occur during capture",
+        "fia_layout": "identity block table prepared once; zero-copy cache views created inside each call",
         "candidate_validation": [],
         "cases": [],
     }
@@ -316,21 +276,15 @@ def benchmark(output, warmup, repeats, graph_batch):
             meta = dict(q_lens=(1,), kv_lens=(64,), query_start=(visible - 1,))
             expected = expanded_reference(**cpu, **meta)
             validation = {"seed": seed, "visible": visible}
-            validation["torch_fp32"] = assert_fp16_close(
-                torch_fp32_core(inputs, meta).cpu(), expected)
+            validation["torch_fp32"] = assert_fp16_close(torch_fp32_core(inputs, meta).cpu(), expected)
             if fia_supported:
                 try:
                     actual = fia_core(inputs, meta, block_table)
                     torch.npu.synchronize()
                     validation["cann_fia"] = assert_fp16_close(actual.cpu(), expected)
                 except RuntimeError as error:
-                    result["fia_unavailable"] = {
-                        "seed": seed,
-                        "visible": visible,
-                        "error": str(error)
-                    }
-                    (output / "candidate_status.json"
-                    ).write_text(json.dumps(result["fia_unavailable"], indent=2) + "\n")
+                    result["fia_unavailable"] = {"seed": seed, "visible": visible, "error": str(error)}
+                    (output / "candidate_status.json").write_text(json.dumps(result["fia_unavailable"], indent=2) + "\n")
                     if "507015" in str(error) or "aicore execution is abnormal" in str(error):
                         raise
                     fia_supported = False
@@ -359,13 +313,17 @@ def benchmark(output, warmup, repeats, graph_batch):
                 entry["graph_error"] = str(error)
             case["methods"][name] = entry
             print(
-                "GMLA_TIMING " + json.dumps({
-                    "visible": visible,
-                    "method": name,
-                    "eager_event_median_us": eager["event_interval"]["median"],
-                    "graph_median_us": entry.get("graph", {}).get("per_call", {}).get("median")
-                }),
-                flush=True)
+                "GMLA_TIMING "
+                + json.dumps(
+                    {
+                        "visible": visible,
+                        "method": name,
+                        "eager_event_median_us": eager["event_interval"]["median"],
+                        "graph_median_us": entry.get("graph", {}).get("per_call", {}).get("median"),
+                    }
+                ),
+                flush=True,
+            )
         kernels, arguments = make_stages(cpu, inputs, visible)
         for name, kernel in kernels.items():
             function = partial(kernel, *arguments[name])
@@ -374,8 +332,7 @@ def benchmark(output, warmup, repeats, graph_batch):
             torch.npu.synchronize()
             graph, _ = graph_timing(function, graph_batch, repeats)
             case["tilelang_stages"][name] = graph
-            (output / f"visible_{visible}_{name}.cpp").write_text(
-                kernel.get_kernel_source(), encoding="utf-8")
+            (output / f"visible_{visible}_{name}.cpp").write_text(kernel.get_kernel_source(), encoding="utf-8")
         result["cases"].append(case)
         (output / "benchmark.json").write_text(json.dumps(result, indent=2) + "\n")
     return result

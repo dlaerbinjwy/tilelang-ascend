@@ -28,9 +28,9 @@ def q_absorb_kernel():
 
     @T.prim_func
     def main(
-            Q: T.Tensor((1, 1, 1, 128), "float16"),
-            W: T.Tensor((1, 128, 512), "float16"),
-            QL: T.Tensor((512,), "float32"),
+        Q: T.Tensor((1, 1, 1, 128), "float16"),
+        W: T.Tensor((1, 128, 512), "float16"),
+        QL: T.Tensor((512,), "float32"),
     ):
         with T.Kernel(4, is_npu=True) as (cid, vid):
             r0 = (cid * 2 + vid) * 64
@@ -64,11 +64,11 @@ def score_kernel(visible_keys: int, scale: float):
 
     @T.prim_func
     def main(
-            QL: T.Tensor((512,), "float32"),
-            QA: T.Tensor((1, 1, 1, 64), "float16"),
-            C: T.Tensor((1, 64, 512), "float16"),
-            E: T.Tensor((1, 64, 64), "float16"),
-            S: T.Tensor((64,), "float32"),
+        QL: T.Tensor((512,), "float32"),
+        QA: T.Tensor((1, 1, 1, 64), "float16"),
+        C: T.Tensor((1, 64, 512), "float16"),
+        E: T.Tensor((1, 64, 64), "float16"),
+        S: T.Tensor((64,), "float32"),
     ):
         with T.Kernel(1, is_npu=True) as (_, vid):
             t0 = vid * 32
@@ -109,8 +109,7 @@ def score_kernel(visible_keys: int, scale: float):
                 T.tile.add(acc, acc, part)
                 T.barrier_all()
                 for i in T.Parallel(32):
-                    acc[i] = T.if_then_else(t0 + i < visible_keys, acc[i] * scale,
-                                            -T.infinity("float32"))
+                    acc[i] = T.if_then_else(t0 + i < visible_keys, acc[i] * scale, -T.infinity("float32"))
                 T.barrier_all()
                 T.copy(acc, S[t0])
                 T.barrier_all()
@@ -156,9 +155,9 @@ def latent_readout_kernel(visible_keys: int):
 
     @T.prim_func
     def main(
-            P: T.Tensor((64,), "float32"),
-            C: T.Tensor((1, 64, 512), "float16"),
-            Z: T.Tensor((512,), "float32"),
+        P: T.Tensor((64,), "float32"),
+        C: T.Tensor((1, 64, 512), "float16"),
+        Z: T.Tensor((512,), "float32"),
     ):
         with T.Kernel(4, is_npu=True) as (cid, vid):
             r0 = (cid * 2 + vid) * 64
@@ -194,11 +193,11 @@ def value_gate_kernel():
 
     @T.prim_func
     def main(
-            Z: T.Tensor((512,), "float32"),
-            W: T.Tensor((1, 128, 512), "float16"),
-            G: T.Tensor((1, 1, 1, 128), "float16"),
-            U: T.Tensor((128,), "float32"),
-            Y: T.Tensor((1, 1, 1, 128), "float16"),
+        Z: T.Tensor((512,), "float32"),
+        W: T.Tensor((1, 128, 512), "float16"),
+        G: T.Tensor((1, 1, 1, 128), "float16"),
+        U: T.Tensor((128,), "float32"),
+        Y: T.Tensor((1, 1, 1, 128), "float16"),
     ):
         with T.Kernel(2, is_npu=True) as (cid, vid):
             v0 = (cid * 2 + vid) * 32
@@ -210,16 +209,7 @@ def value_gate_kernel():
             gf = T.alloc_ub((32,), "float32")
             sigmoid = T.alloc_ub((32,), "float32")
             yh = T.alloc_ub((32,), "float16")
-            T.annotate_address({
-                z: 0,
-                wh: 2048,
-                wf: 34816,
-                out: 100352,
-                gh: 100480,
-                gf: 100544,
-                sigmoid: 100672,
-                yh: 100800
-            })
+            T.annotate_address({z: 0, wh: 2048, wf: 34816, out: 100352, gh: 100480, gf: 100544, sigmoid: 100672, yh: 100800})
             with T.Scope("V"):
                 T.copy(Z, z)
                 T.copy(W[0, v0, 0], wh)
@@ -243,8 +233,7 @@ def value_gate_kernel():
                 T.tile.exp(sigmoid, sigmoid)
                 T.barrier_all()
                 for i in T.Parallel(32):
-                    sigmoid[i] = T.if_then_else(gf[i] >= 0, 1.0 / (1.0 + sigmoid[i]),
-                                                sigmoid[i] / (1.0 + sigmoid[i]))
+                    sigmoid[i] = T.if_then_else(gf[i] >= 0, 1.0 / (1.0 + sigmoid[i]), sigmoid[i] / (1.0 + sigmoid[i]))
                 T.barrier_all()
                 T.tile.mul(out, out, sigmoid)
                 T.barrier_all()
@@ -261,8 +250,8 @@ def zero_output_kernel():
 
     @T.prim_func
     def main(
-            Q: T.Tensor((1, 1, 1, 128), "float16"),
-            Y: T.Tensor((1, 1, 1, 128), "float16"),
+        Q: T.Tensor((1, 1, 1, 128), "float16"),
+        Y: T.Tensor((1, 1, 1, 128), "float16"),
     ):
         with T.Kernel(1, is_npu=True) as (_, vid):
             out = T.alloc_ub((64,), "float16")
@@ -313,8 +302,7 @@ def gated_mla_core(
     )
     shape = (spec.B, spec.Tq, spec.Tk, spec.H, spec.D, spec.E, spec.R, spec.V)
     if shape != (1, 1, 64, 1, 128, 64, 512, 128):
-        raise NotImplementedError(
-            "L0 decode supports only B=H=Tq=1, Tk=64, D=128, E=64, R=512, V=128")
+        raise NotImplementedError("L0 decode supports only B=H=Tq=1, Tk=64, D=128, E=64, R=512, V=128")
     if spec.q_lens[0] == 0:
         fn = zero_output_kernel()
         result = fn(q_content)

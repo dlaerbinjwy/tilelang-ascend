@@ -12,6 +12,7 @@ from gated_mla_golden import check_case, make_decode_inputs
 @pytest.fixture(scope="module")
 def npu_device():
     import torch_npu  # noqa: F401
+
     if not torch.npu.is_available():
         pytest.fail("NPU tests require an Ascend device; no silent device skips")
     torch.npu.set_device(0)
@@ -29,25 +30,30 @@ def test_decode_full_chain(npu_device, seed):
         dict(q_lens=(1,), kv_lens=(64,), query_start=(63,)),
         case_name=f"seed_{seed}",
         output_dir=destination(),
-        repeat=3)
+        repeat=3,
+    )
 
 
-@pytest.mark.parametrize("kv_len,position", [
-    pytest.param(1, 0, marks=pytest.mark.low_priority),
-    (17, 16),
-    pytest.param(63, 62, marks=pytest.mark.low_priority),
-    (64, 16),
-])
+@pytest.mark.parametrize(
+    "kv_len,position",
+    [
+        pytest.param(1, 0, marks=pytest.mark.low_priority),
+        (17, 16),
+        pytest.param(63, 62, marks=pytest.mark.low_priority),
+        (64, 16),
+    ],
+)
 def test_decode_valid_length_and_causal(npu_device, kv_len, position):
     inputs = make_decode_inputs(3)
     # Large finite tail values expose missing masks without violating input contract.
-    inputs["latent_kv"][:, position + 1:] = 32
-    inputs["key_aux"][:, position + 1:] = -32
+    inputs["latent_kv"][:, position + 1 :] = 32
+    inputs["key_aux"][:, position + 1 :] = -32
     check_case(
         inputs,
         dict(q_lens=(1,), kv_lens=(kv_len,), query_start=(position,)),
         case_name=f"mask_{kv_len}_{position}",
-        output_dir=destination())
+        output_dir=destination(),
+    )
 
 
 def test_decode_gate_zero_and_saturation(npu_device):
@@ -55,19 +61,11 @@ def test_decode_gate_zero_and_saturation(npu_device):
     inputs["gate_logits"].zero_()
     inputs["gate_logits"][..., :32] = -20
     inputs["gate_logits"][..., 96:] = 20
-    check_case(
-        inputs,
-        dict(q_lens=(1,), kv_lens=(64,), query_start=(63,)),
-        case_name="gate",
-        output_dir=destination())
+    check_case(inputs, dict(q_lens=(1,), kv_lens=(64,), query_start=(63,)), case_name="gate", output_dir=destination())
 
 
 def test_decode_inactive_query(npu_device):
-    check_case(
-        make_decode_inputs(4),
-        dict(q_lens=(0,), kv_lens=(0,), query_start=(0,)),
-        case_name="inactive",
-        output_dir=destination())
+    check_case(make_decode_inputs(4), dict(q_lens=(0,), kv_lens=(0,), query_start=(0,)), case_name="inactive", output_dir=destination())
 
 
 def test_decode_zero_query_reads_mean(npu_device):
@@ -75,11 +73,7 @@ def test_decode_zero_query_reads_mean(npu_device):
     inputs["q_content"].zero_()
     inputs["q_aux"].zero_()
     inputs["gate_logits"].zero_()
-    check_case(
-        inputs,
-        dict(q_lens=(1,), kv_lens=(17,), query_start=(16,)),
-        case_name="zero_q_mean",
-        output_dir=destination())
+    check_case(inputs, dict(q_lens=(1,), kv_lens=(17,), query_start=(16,)), case_name="zero_q_mean", output_dir=destination())
 
 
 def test_decode_future_and_padding_invariance(npu_device):
@@ -92,8 +86,7 @@ def test_decode_future_and_padding_invariance(npu_device):
     torch.testing.assert_close(first, after, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("visible",
-                         [1, pytest.param(7, marks=pytest.mark.low_priority), 17, 63, 64])
+@pytest.mark.parametrize("visible", [1, pytest.param(7, marks=pytest.mark.low_priority), 17, 63, 64])
 def test_latent_readout_prefix_mask(npu_device, visible):
     """Exercise aligned whole-row tail clearing independently of softmax zeros."""
     import torch_npu  # noqa: F401
@@ -126,6 +119,7 @@ def test_decode_extreme_scale_single_key(npu_device):
     # Official FP16 scores overflow at this scale; compare FP32 official separately.
     import torch_npu  # noqa: F401
     from example_gated_mla_decode import gated_mla_core
+
     device_inputs = {name: t.npu() for name, t in inputs.items()}
     meta = dict(q_lens=(1,), kv_lens=(1,), query_start=(0,), scale=1e27)
     result, intermediates, _ = gated_mla_core(
@@ -142,6 +136,7 @@ def test_decode_extreme_scale_single_key(npu_device):
 def test_decode_contract_rejects_before_kernel(npu_device):
     import torch_npu  # noqa: F401
     from example_gated_mla_decode import gated_mla_core
+
     inputs = {name: t.npu() for name, t in make_decode_inputs().items()}
     meta = dict(q_lens=(1,), kv_lens=(64,), query_start=(63,))
     with pytest.raises(ValueError, match="exceeds"):
