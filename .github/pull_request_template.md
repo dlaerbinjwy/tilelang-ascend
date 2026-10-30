@@ -32,6 +32,41 @@
 
 性能摘要/报告链接：<!-- 填写结果或附件；不适用时说明原因 -->
 
+### Pytest 接入修改细则
+
+新增或迁移算子测试时，按以下步骤修改。可参考已合入的 [batch_gemm 测试](https://github.com/tile-ai/tilelang-ascend/blob/ascendc_pto/examples/batch_gemm/test_batch_gemm.py)。
+
+1. **补齐测试入口。** 在算子目录的 `test_*.py` 中提供 pytest 可收集的 `test_*` 函数，复用已有 `run_*` 或验证函数。仅改文件名不能完成迁移；带 NPU 初始化、参数解析或执行副作用的源模块，应在测试函数或 fixture 内加载，避免收集阶段运行算子。
+2. **让失败传递给 pytest。** 对明确返回布尔状态的函数使用断言；返回元组时，按返回值定义取出通过状态后断言。内部已做数值断言、成功返回 `None` 的函数直接调用，不要机械地写成 `assert run_*()`。直接比较输出时使用 `torch.testing.assert_close` 等数值断言。不能只打印结果、返回 `False` 或捕获异常后继续判通过。在 pytest 进程内复用测试逻辑，避免用子进程包装后丢失现有覆盖率采集。
+3. **接好初始化并隔离副作用。** 将必要的设备设置和随机种子接入测试调用路径；pytest 不会自动执行 `__main__`。需要显式使用 `runpy` 且捕获 `SystemExit` 时，仅接受退出码为 `None` 或 `0`，其他退出码和断言失败必须继续抛出。导入时有 `parse_args()` 的模块，应暂存并替换 `sys.argv`，在 `finally` 中恢复；对临时修改的默认设备、导入路径等状态也要恢复。源模块会清理编译缓存时，应先在 fixture 中隔离缓存目录，结束后恢复，避免并行用例互相删除编译产物；可参考 [缓存隔离样例](https://github.com/tile-ai/tilelang-ascend/blob/ascendc_pto/examples/tile_kernels/quant/test_per_block_cast_lossless_kernel.py)。
+4. **明确实际执行范围。** 按现有 marker 规则在 PR 阶段保留 L0 和关键回归，非核心扩展组合标记 `low_priority`；benchmark 和原本非阻塞的 Boundary 检查应明确安排。脚本的 `--level l0` 默认值不会限制 pytest 收集，不要将所有 `run_*` 批量改名后直接接入 CI。迁移前后应逐项核对用例、参考实现和容差；有意改变检查范围或精度标准时，说明差异及理由。
+5. **配套核对 manifest。** 作者列出源文件与测试文件的仓库相对路径，由作者或维护者核对 `ci/operator_test_manifest.yaml` 中的映射；已有预留条目直接沿用，路径变更时同步更新。源文件与测试文件须为不同文件，且两者均存在时映射才生效。登记生效后，legacy runner 的 Python 脚本收集会跳过两者，测试交给 pytest；还应检查外层 `.sh` 或自定义任务是否再次手动调用它们，避免重复执行或遗漏原检查。
+6. **附实际验证结果。** 在目标 Ascend NPU 环境先确认至少选中一个用例，再按对应 CI 通道的路径、marker 和并发数运行。核对 manifest 校验通过、目标测试出现在 `list-tests` 中，并附环境、完整命令、选中及通过/失败/跳过数量和耗时。收集成功不能作为精度通过；扩展用例另记录全量运行结果。
+
+例如，`run_l0_tests()` 已完成必要初始化并明确返回布尔状态时：
+
+```python
+def test_operator_l0():
+    assert run_l0_tests(), "L0 correctness check failed"
+```
+
+在仓库根目录，将下列路径替换为实际测试文件路径：
+
+```bash
+TEST_FILE="examples/your_operator/test_your_operator.py"
+python -m pytest "$TEST_FILE" --collect-only -q -m "not (low_priority or ci_skip)"
+python scripts/ci/resolve_operator_tests.py validate
+python scripts/ci/resolve_operator_tests.py list-tests
+# 当前 CI 的迁移算子批次使用 8 个 worker，增量 pytest 通道使用 4 个；
+# 按本次对应通道设置，具体以 .github/workflows/ci_cd.yml 为准。
+PYTEST_WORKERS=8
+python -m pytest "$TEST_FILE" --forked -v -n "$PYTEST_WORKERS" -m "not (low_priority or ci_skip)"
+# 单独验证每日/全量范围；保留 low_priority，仅排除 ci_skip。
+python -m pytest "$TEST_FILE" --forked -v -n "$PYTEST_WORKERS" -m "not ci_skip"
+```
+
+覆盖率路径由 `examples/bench_test.sh` 逐文件执行，配置不同于上述并发精度测试；需要覆盖率结果时，另按该路径验证。
+
 ## 2. 框架及接口代码合入标准
 
 - [ ] 框架或接口修改已在双后端/默认 target 下验证，不影响现有算子用例；能力边界已明确。
@@ -42,8 +77,7 @@
 - [ ] 算子及对应测试用例已在本地多轮重复验证，未发现概率性失败；如出现偶发问题，已定位修复或在“其他补充”中说明。
 - [ ] PR 阶段只保留核心冒烟/L0 与关键回归用例；核心回归不得用 marker 隐藏。
 - [ ] 非核心扩展组合统一标记 `low_priority`，由每日/全量任务使用 `-m "not ci_skip"` 执行；`ci_skip` 仅用于已有 Issue 的已知不稳定或硬件限制。
-- [ ] 已避免无意义泛化、重复编译和重复执行；新增/迁移测试已登记 `ci/operator_test_manifest.yaml`，legacy runner 与 pytest 不重复。
-- [ ] 如未新增或迁移算子测试，已注明 manifest 不适用及原因。
+- [ ] 已避免无意义泛化、重复编译和重复执行；涉及算子 pytest 接入时已完成第 1 节的修改和验证，不适用时已说明原因。
 - [ ] 已更新对应文档，明确 API、后端、dtype、shape 或硬件能力边界；无文档变更时已说明原因。
 
 ## 3. PR 提交规范
